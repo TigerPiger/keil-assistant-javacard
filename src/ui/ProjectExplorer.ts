@@ -998,15 +998,18 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                 }
             }
 
-            // 4) 构建虚拟目录树（virtualSymlink 策略）
-            //    统一虚拟根下并列 JCVM/（工程源码 symlink）和 JCRE/（Java Card 运行时 API symlink）
-            //    这两类内容共用一个 workspace folder，Ctrl+Shift+F 能同时搜到工程源码和 JCRE 标准库
+            // 4) 构建虚拟目录树
+            //    AddStrategy 只管 JCVM（工程源码）的展示方式：
+            //      - virtualSymlink → 按 TargetName/GroupName 层级组织虚拟树
+            //      - minimalCommonRoot → 直接用物理目录，扁平展示
+            //    JCRE（Java Card 运行时 API）与 AddStrategy 无关——它本来就没有物理目录，
+            //    无论什么策略都必须构建虚拟树，否则 mask.c 引用的标准 API 源码在 workspace 里不可见
             const virtualFolders: { path: string; name: string }[] = [];
             const linkedFiles = new Set<string>();
             let anyVirtualLinked = false;
 
+            // 4a) JCVM：工程源码（受 AddStrategy 控制）
             if (addStrategy === 'virtualSymlink') {
-                // 4a) JCVM：工程源码
                 for (const { prj, targets } of plansByPrj.values()) {
                     const state = this.buildVirtualTree(prj, targets, norm);
 
@@ -1015,13 +1018,24 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                         anyVirtualLinked = true;
                     }
                 }
+            } else if (this.virtualStateByPrj.size > 0) {
+                // 切到 minimalCommonRoot → 清理旧的 JCVM 虚拟树（保留 JCRE）
+                for (const state of this.virtualStateByPrj.values()) {
+                    const jcvmPath = join(this.virtualStorageRoot, 'JCVM', state.prjSubdir);
 
-                // 4b) JCRE：mask.c 引用的 Java Card 标准 API 源码
-                //     需要 KeilAssistant.Keil.JCRE 配置指向 JCRE 源码根；未配置则跳过
-                const jcrePath = resMgr.getJcrePath();
+                    if (existsSync(jcvmPath)) {
+                        try { rmSync(jcvmPath, { recursive: true, force: true }); } catch { /* 忽略 */ }
+                    }
+                }
+                this.virtualStateByPrj.clear();
+            }
 
+            // 4b) JCRE：mask.c 引用的 Java Card 标准 API 源码（始终构建，不受 AddStrategy 影响）
+            //     需要 KeilAssistant.Keil.JCRE 配置指向 JCRE 源码根；未配置则跳过
+            const jcrePath = resMgr.getJcrePath();
+
+            if (jcrePath) {
                 for (const { prj } of plansByPrj.values()) {
-                    if (!jcrePath) break;
                     const jcreState = this.buildJcreTree(prj, jcrePath, norm);
 
                     if (jcreState && jcreState.linked.size > 0) {
@@ -1029,14 +1043,11 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                         anyVirtualLinked = true;
                     }
                 }
+            }
 
-                // 任何 symlink 成功 → 把统一根加入工作区
-                if (anyVirtualLinked) {
-                    virtualFolders.push({ path: this.virtualStorageRoot, name: 'Keil Virtual' });
-                }
-            } else if (this.virtualStateByPrj.size > 0 || this.jcreStateByPrj.size > 0) {
-                // 已切到 minimalCommonRoot 策略 → 清理旧的虚拟树（JCVM + JCRE）
-                this.cleanupVirtualDirs();
+            // 任何虚拟链接成功（JCVM 或 JCRE）→ 把统一根加入工作区
+            if (anyVirtualLinked) {
+                virtualFolders.push({ path: this.virtualStorageRoot, name: 'Keil Virtual' });
             }
 
             // 5) 计算最小物理目录集合（去掉被祖先覆盖的子目录）

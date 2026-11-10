@@ -1046,13 +1046,14 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             // 6) 决定要加入工作区的目录
             //    虚拟树完整覆盖 + 搜索会跟随符号链接 → 跳过物理目录，避免同一文件出现两条搜索结果；
             //    否则保留物理目录，确保 Ctrl+Shift+F 一定能搜到（例如 symlink 创建失败、或用户关闭了 followSymlinks）。
+            //    注意：现在 JCVM/JCRE 虚拟树始终构建，所以去重逻辑也始终生效，不再受 AddStrategy 限制。
             const followSymlinks = workspace.getConfiguration('search').get<boolean>('followSymlinks', true);
             const dirsToAdd: { path: string; name: string }[] = [...virtualFolders];
             let skippedPhysicalCount = 0;
 
             for (const dir of minimalDirs) {
                 const files = filesByDir.get(dir) ?? new Set<string>();
-                const fullyLinked = addStrategy === 'virtualSymlink' && followSymlinks &&
+                const fullyLinked = followSymlinks &&
                     files.size > 0 && Array.from(files).every(f => linkedFiles.has(f));
 
                 if (fullyLinked) {
@@ -1068,7 +1069,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                 );
             }
 
-            if (!followSymlinks && addStrategy === 'virtualSymlink' && minimalDirs.length > 0) {
+            if (!followSymlinks && minimalDirs.length > 0) {
                 this.channel.appendLine(
                     '[keil-assistant] 检测到 search.followSymlinks 已关闭：符号链接中的文件不会被 Ctrl+Shift+F 搜索，已改为同时加入物理源码目录。建议开启该设置以获得去重后的搜索结果。'
                 );
@@ -1285,7 +1286,26 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         uvList.push(...ResourceManager.getInstance().getProjectFileLocationList());
 
         // Filter out excluded files
-        uvList = uvList.filter(path => !excludeList.includes(extname(path).toLowerCase()));
+        // excludeList 每项支持三种匹配：
+        //   1) 扩展名匹配（原有行为）：".uvprojx" → 排除所有 .uvprojx 文件
+        //   2) 完整文件名："DETECT.uvprojx" → 排除 basename 为该值的文件
+        //   3) 路径片段："test" → 排除路径中包含 test 的文件（不区分大小写）
+        uvList = uvList.filter(path => {
+            const lower = path.toLowerCase();
+            const bName = basename(path).toLowerCase();
+
+            for (const rule of excludeList) {
+                const r = rule.toLowerCase();
+
+                // 扩展名匹配：以 . 开头
+                if (r.startsWith('.') && lower.endsWith(r)) return false;
+                // 完整文件名匹配
+                if (bName === r) return false;
+                // 路径片段匹配：路径中包含该片段（用户想排除 test/ 目录等）
+                if (lower.includes(r)) return false;
+            }
+            return true;
+        });
 
         const hasMultiplyProject = uvList.length > 1; //Multiply
 

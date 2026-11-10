@@ -105,8 +105,8 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         // 记录虚拟根，用于关闭工程时清理
         this.virtualRootByPrj.set(prj.prjID, virtualRoot);
 
-        // 虚拟 Target 目录：TargetName（去空格避免路径问题）
-        const targetDirName = target.targetName.replace(/[<>"|?*]/g, '_');
+        // 虚拟 Target 目录固定命名为 "JCVM"，作为源码树的统一根目录，方便全局搜索。
+        const targetDirName = 'JCVM';
         const targetDir = join(virtualRoot, targetDirName);
 
         // 清理旧 Target 目录后重建（避免残留）

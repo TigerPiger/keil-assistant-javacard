@@ -999,35 +999,24 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             }
 
             // 4) 构建虚拟目录树
-            //    AddStrategy 只管 JCVM（工程源码）的展示方式：
-            //      - virtualSymlink → 按 TargetName/GroupName 层级组织虚拟树
-            //      - minimalCommonRoot → 直接用物理目录，扁平展示
-            //    JCRE（Java Card 运行时 API）与 AddStrategy 无关——它本来就没有物理目录，
-            //    无论什么策略都必须构建虚拟树，否则 mask.c 引用的标准 API 源码在 workspace 里不可见
+            //    JCVM 和 JCRE 都始终构建虚拟树——它们提供 TargetName/GroupName 和
+            //    javacard/framework 的层级视图，是物理目录扁平展示无法替代的。
+            //    AddStrategy 只管后续的"物理目录去重"逻辑（见步骤 6）：
+            //      - virtualSymlink → 虚拟树完整覆盖时跳过物理目录，避免搜索结果重复
+            //      - minimalCommonRoot → 保留物理目录（不跳过），用户可直接在物理路径下编辑
             const virtualFolders: { path: string; name: string }[] = [];
             const linkedFiles = new Set<string>();
             let anyVirtualLinked = false;
 
-            // 4a) JCVM：工程源码（受 AddStrategy 控制）
-            if (addStrategy === 'virtualSymlink') {
-                for (const { prj, targets } of plansByPrj.values()) {
-                    const state = this.buildVirtualTree(prj, targets, norm);
+            // 4a) JCVM：工程源码虚拟树（TargetName/GroupName 层级）
+            //     始终构建，让 workspace 里始终能看到按 Keil GroupName 组织的源码视图
+            for (const { prj, targets } of plansByPrj.values()) {
+                const state = this.buildVirtualTree(prj, targets, norm);
 
-                    if (state && state.linked.size > 0) {
-                        state.linked.forEach(f => linkedFiles.add(f));
-                        anyVirtualLinked = true;
-                    }
+                if (state && state.linked.size > 0) {
+                    state.linked.forEach(f => linkedFiles.add(f));
+                    anyVirtualLinked = true;
                 }
-            } else if (this.virtualStateByPrj.size > 0) {
-                // 切到 minimalCommonRoot → 清理旧的 JCVM 虚拟树（保留 JCRE）
-                for (const state of this.virtualStateByPrj.values()) {
-                    const jcvmPath = join(this.virtualStorageRoot, 'JCVM', state.prjSubdir);
-
-                    if (existsSync(jcvmPath)) {
-                        try { rmSync(jcvmPath, { recursive: true, force: true }); } catch { /* 忽略 */ }
-                    }
-                }
-                this.virtualStateByPrj.clear();
             }
 
             // 4b) JCRE：mask.c 引用的 Java Card 标准 API 源码（始终构建，不受 AddStrategy 影响）

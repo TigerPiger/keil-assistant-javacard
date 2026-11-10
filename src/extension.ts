@@ -5,9 +5,6 @@ import {
     commands, env, l10n, window
 } from 'vscode';
 
-import { dirname } from 'path';
-
-import { File } from './node_utility/File';
 import { ResourceManager } from './ResourceManager';
 
 import { stat } from 'fs';
@@ -48,18 +45,11 @@ export function activate(context: ExtensionContext) {
 
         try {
             if (uri && uri.length > 0) {
-
-                // load project
+                // openProject 内部会自动把 uvprojx 所在目录加入工作区（非破坏性），
+                // 然后加载工程；工作区变更会触发 onDidChangeWorkspaceFolders 监听 → syncWorkspaceFolders
                 const uvPrjPath = uri[0].fsPath;
 
                 await prjExplorer.openProject(uvPrjPath, false);
-                // switch workspace
-                const msg = l10n.t('keil project load done ! switch workspace ?');
-                const result = await window.showInformationMessage(msg, l10n.t('Ok'), l10n.t('Later'));
-
-                if (result === l10n.t('Ok')) {
-                   prjExplorer.openWorkspace(new File(dirname(uvPrjPath)));
-                }
             }
         } catch (error) {
             const errMsg = l10n.t('Open project failed! msg');

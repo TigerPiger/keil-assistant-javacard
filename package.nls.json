@@ -25,5 +25,9 @@
         ]
     },
     "keil-assistant.contributes.viewsWelcome.project.content": "keil project not found [learn more](https://github.com/jacksonjim/keil-assistant/blob/master/README.md).\n[Open project](command:explorer.open)",
-    "keil-assistant.contributes.conf.props.project.FindMaxDepth.description": "uVision project file search depth"
+    "keil-assistant.contributes.conf.props.project.FindMaxDepth.description": "uVision project file search depth",
+    "keil-assistant.contributes.conf.props.workspace.autoAddExternalSources.description": "Automatically add external source files referenced in .uvprojx to VS Code workspace folders, so they appear in Explorer and are searchable via Ctrl+Shift+F. Set to false to disable automatic sync.",
+    "keil-assistant.contributes.conf.props.workspace.processMode.description": "Which Target's source files to process when collecting external source paths from .uvprojx.",
+    "keil-assistant.contributes.conf.props.workspace.addStrategy.description": "Strategy for adding external source directories to VS Code workspace.",
+    "keil-assistant.contributes.conf.props.workspace.confirmBeforeAdd.description": "Show a confirmation dialog before adding external source directories to the workspace."
 }

@@ -1,5 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
-import { statSync, readFileSync, readdirSync, mkdirSync, symlinkSync, linkSync, rmSync, existsSync } from "fs";
+import { statSync, readFileSync, readdirSync, mkdirSync, symlinkSync, rmSync, existsSync } from "fs";
 import { basename, dirname, extname, join, normalize, resolve, sep } from "path";
 import type {
     Event, ExtensionContext, ProviderResult, TreeDataProvider,
@@ -36,184 +36,315 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
     private isSyncing = false;
     // 事件 debounce 定时器，合并短时间内多次 onDidChangeWorkspaceFolders 触发
     private syncDebounceTimer: ReturnType<typeof setTimeout> | undefined;
-    // 虚拟工作区根目录：所有符号链接都创建在这里，按 TargetName/GroupName 层级组织
-    // 格式：{uvprojx所在目录}/_keil_virtual/
-    private virtualRootByPrj: Map<string, string> = new Map();
+    // 虚拟工作区统一根目录：一个固定的 JCVM，里面按 工程名/TargetName/GroupName 组织所有源码符号链接
+    // 放在扩展全局存储中，绝不写入用户的工程目录
+    private virtualStorageRoot: string;
+    // 每个工程上一次生成的虚拟树状态：signature 未变化时直接复用，避免无谓的删除/重建
+    private virtualStateByPrj: Map<string, { prjSubdir: string; signature: string; linked: Set<string> }> = new Map();
+    // 当前环境是否支持创建符号链接（探测到 EPERM 后置为 true，不再重复尝试）
+    private symlinkUnsupported = false;
 
     constructor(context: ExtensionContext, private channel: OutputChannel, private myStatusBarItem: StatusBarItem) {
         this.prjList = new Map();
         this.viewEvent = new EventEmitter();
         this.onDidChangeTreeData = this.viewEvent.event;
+        this.workspacePath = '';
+        // 虚拟符号链接统一根：固定命名为 JCVM，所有工程的符号链接都放在这里
+        // 路径位于扩展全局存储中，绝不写入用户工程目录
+        this.virtualStorageRoot = join(context.globalStorageUri.fsPath, 'keil-workspace', 'JCVM');
+
         context.subscriptions.push(window.registerTreeDataProvider('project', this));
         context.subscriptions.push(commands.registerCommand(this.itemClickCommand, (item: IView) => this.onItemClick(item)));
-        this.workspacePath = '';
 
         // 监听工作区文件夹变更，做 debounce 后触发 syncWorkspaceFolders
         context.subscriptions.push(workspace.onDidChangeWorkspaceFolders(() => {
             if (this.isSyncing) return;
-            if (this.syncDebounceTimer) clearTimeout(this.syncDebounceTimer);
-            this.syncDebounceTimer = setTimeout(() => {
-                void this.syncWorkspaceFolders();
-            }, 300);
+            this.scheduleSync();
         }));
+
+        // 监听插件配置变化：切换 Target 处理模式/添加策略等配置后立即重新同步工作区
+        context.subscriptions.push(workspace.onDidChangeConfiguration((e) => {
+            if (e.affectsConfiguration('KeilAssistant.Workspace') || e.affectsConfiguration('search.followSymlinks')) {
+                this.scheduleSync();
+            }
+        }));
+    }
+
+    /** 合并短时间内的多次同步请求，避免重复执行 */
+    private scheduleSync(): void {
+        if (this.syncDebounceTimer) clearTimeout(this.syncDebounceTimer);
+        this.syncDebounceTimer = setTimeout(() => { this.scheduleSync(); }, 300);
     }
 
     // ========== 虚拟工作区 & 工作区同步 相关方法 ==========
 
-    /**
-     * 从视图节点树递归收集所有 Source 文件的物理所在目录（绝对路径，规范化）。
-     * 用于 symlink 创建失败时的物理目录 fallback。
-     */
-    private collectSourceDirsFromView(view: IView | undefined, dirs: Set<string>): void {
-        if (!view) return;
-        if (view instanceof Source && view.file.isFile()) {
-            dirs.add(normalize(dirname(view.file.path)).replace(/\\/g, '/'));
-        }
-        const children = view.getChildViews();
-        if (children) children.forEach(c => this.collectSourceDirsFromView(c, dirs));
+    /** 把任意名称转换为安全的目录名（去掉 Windows 非法字符与结尾的点/空格） */
+    private sanitizeDirName(name: string): string {
+        const s = `${name ?? ''}`.replace(/[<>:"/\\|?*]/g, '_').replace(/[. ]+$/g, '').trim();
+
+        return s || '_';
     }
 
     /**
-     * 从活动 Target 收集所有 Source 文件的物理所在目录。
+     * 收集某个 Target 的"分组 → 真实文件"计划（只读解析，不落盘）。
+     * 缺失文件不会进入计划，而是记入 missingPaths 供上层提示。
      */
-    private collectActiveTargetSourceDirs(): Set<string> {
-        const dirs = new Set<string>();
-        for (const prj of this.prjList.values()) {
-            const activeTarget = prj.getActiveTarget();
-            if (activeTarget) this.collectSourceDirsFromView(activeTarget, dirs);
+    private collectTargetPlan(target: PTarget, missingPaths: string[]): { group: string; files: string[] }[] {
+        const groups = target.getChildViews() as FileGroup[] | undefined;
+        const plan: { group: string; files: string[] }[] = [];
+
+        if (!groups) return plan;
+
+        for (const group of groups) {
+            const files: string[] = [];
+
+            for (const source of group.sources) {
+                const realPath = normalize(source.file.path);
+
+                if (!source.file.isFile()) {
+                    missingPaths.push(realPath);
+                    continue;
+                }
+                files.push(realPath);
+            }
+            plan.push({ group: group.label, files });
         }
-        return dirs;
+
+        return plan;
     }
 
     /**
-     * 按 FileGroup→Source 层级创建虚拟工作区目录树。
-     *
-     * 目录结构：
-     *   {uvprojx所在目录}/_keil_virtual/{TargetName}/{GroupName}/{SourceName} → symlink 指向真实文件
-     *
-     * symlink 创建策略（Windows 权限兼容）：
-     *   1. 先用 fs.symlinkSync(target, path, 'file') 尝试文件符号链接
-     *   2. 失败 (EACCES) 时用 fs.linkSync(target, path) 硬链接（不需要权限，仅限同卷）
-     *   3. 都失败则跳过该文件（fallback 到物理目录聚合）
-     *
-     * @returns 虚拟 Target 目录路径，或 null（symlink 全部失败）
+     * 生成组内唯一的链接文件名：冲突时先加父目录前缀，仍冲突则追加 ~2/~3 序号。
+     * @param used 本组已使用的文件名（小写，Windows 大小写不敏感）
      */
-    private createVirtualTargetDirs(prj: KeilProject, target: PTarget): string | null {
-        const uvprjDir = dirname(prj.uvprjFile.path);
-        const virtualRoot = join(uvprjDir, '_keil_virtual');
+    private makeUniqueLinkName(used: Set<string>, realPath: string): string {
+        const base = basename(realPath);
+        let name = base;
+        const lower = (s: string) => s.toLowerCase();
 
-        // 记录虚拟根，用于关闭工程时清理
-        this.virtualRootByPrj.set(prj.prjID, virtualRoot);
-
-        // 虚拟 Target 目录固定命名为 "JCVM"，作为源码树的统一根目录，方便全局搜索。
-        const targetDirName = 'JCVM';
-        const targetDir = join(virtualRoot, targetDirName);
-
-        // 清理旧 Target 目录后重建（避免残留）
-        if (existsSync(targetDir)) {
-            try { rmSync(targetDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+        if (used.has(lower(name))) {
+            name = `${basename(dirname(realPath))}_${base}`;
         }
 
+        let i = 2;
+
+        while (used.has(lower(name))) {
+            const dot = base.lastIndexOf('.');
+
+            name = dot > 0 ? `${base.slice(0, dot)}~${i}${base.slice(dot)}` : `${base}~${i}`;
+            i++;
+        }
+        used.add(lower(name));
+
+        return name;
+    }
+
+    /**
+     * 构建/更新某个工程在统一虚拟根（JCVM）下的目录树：
+     *   <globalStorage>/keil-workspace/JCVM/{工程名}/{TargetName}/{GroupName}/{FileName} → symlink(真实文件)
+     *
+     * 设计要点：
+     *  - 全局统一一个 JCVM 目录，所有工程的符号链接都放在这里，工作区里只需要加入这一个 folder
+     *  - 重建时只删当前工程的子目录（JCVM/{工程名}/），不影响其他工程的链接
+     *  - 内容签名未变化时直接复用上次结果，避免无谓删除/重建
+     *  - 只创建符号链接（不创建硬链接）：硬链接在 VS Code 保存（临时文件 + rename）时会被切断，
+     *    会导致"在虚拟树里编辑，原文件不更新"的数据丢失问题
+     *
+     * @returns 该工程成功链接的真实文件集合；undefined 表示本次完全没有 symlink（权限问题）
+     */
+    private buildVirtualTree(
+        prj: KeilProject,
+        targets: { target: PTarget; plan: { group: string; files: string[] }[] }[],
+        norm: (p: string) => string,
+    ): { linked: Set<string> } | undefined {
+        // 已知当前环境不支持符号链接 → 直接跳过虚拟树，走物理目录兜底
+        if (this.symlinkUnsupported) return undefined;
+
+        // 统一虚拟根：固定叫 JCVM，整个应用生命周期里只建一次
+        const jcvmRoot = this.virtualStorageRoot;
+        const prjSubdir = this.sanitizeDirName(prj.label);
+        const prjRoot = join(jcvmRoot, prjSubdir);
+
+        const signature = JSON.stringify(targets.map(t => [t.target.targetName, t.plan]));
+        const prev = this.virtualStateByPrj.get(prj.prjID);
+
+        // 内容没变且子目录还在 → 直接复用，不做任何磁盘操作
+        if (prev && prev.signature === signature && existsSync(prjRoot)) {
+            return { linked: prev.linked };
+        }
+
+        // 确保统一根存在（所有工程共用这一个目录）
         try {
-            mkdirSync(targetDir, { recursive: true });
+            if (!existsSync(jcvmRoot)) mkdirSync(jcvmRoot, { recursive: true });
         } catch (err) {
-            this.channel.appendLine(`[keil-assistant] 创建虚拟目录失败: ${targetDir}, msg: ${(err as Error).message}`);
+            this.channel.appendLine(`[keil-assistant] 创建虚拟根目录失败: ${jcvmRoot}, msg: ${(err as Error).message}`);
+            this.virtualStateByPrj.delete(prj.prjID);
 
-            return null;
+            return undefined;
         }
 
-        let successCount = 0;
-        let skipCount = 0;
+        // 只重建当前工程的子目录（JCVM/{工程名}/），保留其他工程的链接不受影响
+        try {
+            if (existsSync(prjRoot)) rmSync(prjRoot, { recursive: true, force: true });
+            mkdirSync(prjRoot, { recursive: true });
+        } catch (err) {
+            this.channel.appendLine(`[keil-assistant] 创建工程虚拟目录失败: ${prjRoot}, msg: ${(err as Error).message}`);
+            this.virtualStateByPrj.delete(prj.prjID);
 
-        // 遍历 FileGroup → Source
-        const fGroups = target.getChildViews() as FileGroup[] | undefined;
-
-        if (!fGroups) {
-            this.channel.appendLine(`[keil-assistant] Target '${target.targetName}' 无 FileGroup。`);
-
-            return null;
+            return undefined;
         }
 
-        for (const group of fGroups) {
-            // Group 目录名：保留原始 label，非法字符替换
-            const groupDirName = group.label.replace(/[<>"|?*]/g, '_').trim() || '_Group';
-            const groupDir = join(targetDir, groupDirName);
+        const linked = new Set<string>();
+        let failedCount = 0;
+        let aborted = false;
+
+        for (const { target, plan } of targets) {
+            if (aborted) break;
+
+            const targetDir = join(prjRoot, this.sanitizeDirName(target.targetName));
 
             try {
-                mkdirSync(groupDir, { recursive: true });
+                mkdirSync(targetDir, { recursive: true });
             } catch (err) {
-                this.channel.appendLine(`[keil-assistant] 创建 FileGroup 目录失败: ${groupDir}, msg: ${(err as Error).message}`);
-
+                this.channel.appendLine(`[keil-assistant] 创建 Target 目录失败: ${targetDir}, msg: ${(err as Error).message}`);
                 continue;
             }
 
-            for (const source of group.sources) {
-                if (!source.file.isFile()) {
-                    skipCount++;
+            for (const g of plan) {
+                if (aborted) break;
+
+                const groupDir = join(targetDir, this.sanitizeDirName(g.group));
+
+                try {
+                    mkdirSync(groupDir, { recursive: true });
+                } catch (err) {
+                    this.channel.appendLine(`[keil-assistant] 创建 Group 目录失败: ${groupDir}, msg: ${(err as Error).message}`);
                     continue;
                 }
-                const realPath = source.file.path;
 
-                // 处理同名文件（不同物理路径但文件名相同）：添加父目录前缀避免冲突
-                let linkName = source.file.name;
-                const linkPath = join(groupDir, linkName);
+                const usedNames = new Set<string>();
 
-                // 如果同名冲突，加父目录名前缀
-                if (existsSync(linkPath)) {
-                    const parentName = basename(dirname(realPath));
-                    linkName = `${parentName}_${source.file.name}`;
-                }
-                const finalLinkPath = join(groupDir, linkName);
+                for (const realPath of g.files) {
+                    const linkPath = join(groupDir, this.makeUniqueLinkName(usedNames, realPath));
 
-                // 尝试创建符号链接
-                try {
-                    // 先删可能存在的旧链接
-                    if (existsSync(finalLinkPath)) {
-                        try { rmSync(finalLinkPath, { force: true }); } catch { /* 忽略 */ }
-                    }
-                    symlinkSync(realPath, finalLinkPath, 'file');
-                    successCount++;
-                } catch {
-                    // symlink 失败（通常是权限问题），尝试硬链接
                     try {
-                        linkSync(realPath, finalLinkPath);
-                        successCount++;
-                    } catch {
-                        // 都失败，跳过这个文件
-                        skipCount++;
+                        symlinkSync(realPath, linkPath, 'file');
+                        linked.add(norm(realPath));
+                    } catch (err) {
+                        const code = (err as NodeJS.ErrnoException).code;
+
+                        // 权限类错误说明当前环境根本不支持符号链接（Windows 未开启开发者模式/非管理员）
+                        // → 立即放弃整个虚拟树，避免对成百上千个文件逐个失败
+                        if (code === 'EPERM' || code === 'EACCES' || code === 'UNKNOWN') {
+                            aborted = true;
+                            break;
+                        }
+                        failedCount++;
                     }
                 }
             }
         }
 
+        // 环境不支持符号链接：清掉半成品，标记后不再尝试
+        if (aborted) {
+            try { rmSync(prjRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
+            // 如果 JCVM 根已经空了，也一并删掉，保持干净
+            try {
+                if (existsSync(jcvmRoot) && readdirSync(jcvmRoot).length === 0) {
+                    rmSync(jcvmRoot, { recursive: true, force: true });
+                }
+            } catch { /* 忽略 */ }
+            this.virtualStateByPrj.delete(prj.prjID);
+            this.symlinkUnsupported = true;
+            const tip = '无法创建符号链接（EPERM）。请在 Windows 设置 → 隐私和安全性 → 开发者选项 里开启「开发人员模式」，或让 VS Code 以管理员身份运行。开启后重启 VS Code 再执行一次 "Keil: Sync Workspace Folders"。当前将自动切换到 minimalCommonRoot 扁平策略，Ctrl+Shift+F 全局搜索不受影响。';
+
+            this.channel.appendLine(`[keil-assistant] ${tip}`);
+            window.showInformationMessage(`Keil Assistant: ${tip}`);
+
+            return undefined;
+        }
+
+        this.virtualStateByPrj.set(prj.prjID, { prjSubdir, signature, linked });
+
+        if (failedCount > 0) {
+            this.channel.appendLine(
+                `[keil-assistant] ${prj.label}/${targets.map(t => t.target.targetName).join(', ')}: ${failedCount} 个文件符号链接失败，改由物理目录兜底。`
+            );
+        }
         this.channel.appendLine(
-            `[keil-assistant] Target '${target.targetName}' 虚拟目录: 成功 ${successCount} 个链接, 跳过 ${skipCount} 个文件, 路径 ${targetDir}`
+            `[keil-assistant] 虚拟目录已更新: ${prjRoot}（${linked.size} 个文件）`
         );
 
-        return successCount > 0 ? targetDir : null;
+        return { linked };
     }
 
     /**
-     * 清理指定工程的虚拟工作区根目录。
+     * 清理虚拟目录（指定工程或全部）。
+     * 所有工程共用一个 JCVM 根，清理时只删某工程的子目录，不碰其他工程的链接。
      */
     private cleanupVirtualDirs(prj?: KeilProject): void {
-        if (prj) {
-            const root = this.virtualRootByPrj.get(prj.prjID);
+        const removePrjSubdir = (subdir: string) => {
+            const fullPath = join(this.virtualStorageRoot, subdir);
 
-            if (root && existsSync(root)) {
-                try { rmSync(root, { recursive: true, force: true }); } catch { /* 忽略 */ }
-                this.virtualRootByPrj.delete(prj.prjID);
-                this.channel.appendLine(`[keil-assistant] 已清理虚拟目录: ${root}`);
+            if (existsSync(fullPath)) {
+                try { rmSync(fullPath, { recursive: true, force: true }); } catch { /* 忽略 */ }
+            }
+            // 如果 JCVM 根已空，也一并清掉
+            try {
+                if (existsSync(this.virtualStorageRoot) && readdirSync(this.virtualStorageRoot).length === 0) {
+                    rmSync(this.virtualStorageRoot, { recursive: true, force: true });
+                }
+            } catch { /* 忽略 */ }
+        };
+
+        if (prj) {
+            const state = this.virtualStateByPrj.get(prj.prjID);
+
+            if (state) {
+                removePrjSubdir(state.prjSubdir);
+                this.virtualStateByPrj.delete(prj.prjID);
+                this.channel.appendLine(`[keil-assistant] 已清理虚拟目录: ${join(this.virtualStorageRoot, state.prjSubdir)}`);
             }
         } else {
-            // 清理所有
-            for (const root of this.virtualRootByPrj.values()) {
-                if (existsSync(root)) {
-                    try { rmSync(root, { recursive: true, force: true }); } catch { /* 忽略 */ }
-                }
+            // 清理全部：整个 JCVM 根干掉
+            if (existsSync(this.virtualStorageRoot)) {
+                try { rmSync(this.virtualStorageRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
             }
-            this.virtualRootByPrj.clear();
+            this.virtualStateByPrj.clear();
+            this.channel.appendLine(`[keil-assistant] 已清理全部虚拟目录: ${this.virtualStorageRoot}`);
         }
+    }
+
+    /**
+     * 清理本插件 managed 的所有工作区文件夹条目（当 AutoAddExternalSources 禁用时调用）。
+     */
+    private async cleanupManagedWorkspaceFolders(): Promise<void> {
+        const norm = (p: string) => normalize(p).replace(/\\/g, '/').toLowerCase();
+
+        if (!workspace.workspaceFolders) return;
+
+        const allFolders = workspace.workspaceFolders;
+        const removeIndices: number[] = [];
+
+        for (const managedPath of this.managedFolderPaths) {
+            const idx = allFolders.findIndex(f => norm(f.uri.fsPath) === managedPath);
+
+            if (idx !== -1) removeIndices.push(idx);
+        }
+
+        if (removeIndices.length > 0) {
+            // 从大到小删除，避免索引偏移
+            removeIndices.sort((a, b) => b - a);
+            for (const idx of removeIndices) {
+                await this.removeWorkspaceFolderAt(idx);
+            }
+            this.channel.appendLine(
+                `[keil-assistant] AutoAddExternalSources 已禁用，清理了 ${removeIndices.length} 个 managed 工作区条目。`
+            );
+        }
+
+        this.managedFolderPaths.clear();
+        this.cleanupVirtualDirs();
     }
 
     /**
@@ -233,104 +364,234 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
     }
 
     /**
-     * 根据活动 Target 同步 VS Code 工作区文件夹。
+     * 同步 VS Code 工作区文件夹，使 .uvprojx 引用的外部源码可被 Explorer 看到、被 Ctrl+Shift+F 搜索到。
      *
-     * 策略（优先级从高到低）：
-     *   1. 尝试创建虚拟工作区目录（FileGroup→Source 层级 + symlink）
-     *   2. 若虚拟目录创建成功 → 把虚拟 Target 目录加入工作区
-     *   3. 若虚拟目录创建失败 → fallback 到物理源码目录聚合（旧方案）
-     *   4. 差集为空时直接短路返回（幂等）
+     * 处理流程：
+     *   1. AutoAddExternalSources 关闭 → 清理本插件添加的条目后返回
+     *   2. 按 ProcessMode（activeTarget / allTargets）解析每个 Target 的"分组 → 真实文件"计划
+     *   3. AddStrategy = virtualSymlink 时构建虚拟目录树（TargetName/GroupName 层级，供 Explorer 展示）
+     *   4. 计算需要加入工作区的目录：
+     *      - 虚拟根（层级展示）
+     *      - 未被虚拟树完整覆盖的物理源码目录（保证 Ctrl+Shift+F 一定搜得到）
+     *   5. 与当前 managed 集合求差集 → 先精确移除过期条目，再追加新增条目（幂等，可重复加载）
+     *
+     * 说明：只改动工作区文件夹列表，不修改 .uvprojx 与工程内任何文件。
      */
     private async syncWorkspaceFolders(): Promise<void> {
         this.isSyncing = true;
 
         try {
+            const resMgr = ResourceManager.getInstance();
+
+            this.channel.appendLine('[keil-assistant] syncWorkspaceFolders START');
+
+            // 1) 功能总开关关闭 → 清理历史添加项
+            if (!resMgr.isAutoAddExternalSources()) {
+                this.channel.appendLine('[keil-assistant] sync: AutoAddExternalSources=false，跳过');
+
+                if (this.managedFolderPaths.size > 0) {
+                    await this.cleanupManagedWorkspaceFolders();
+                }
+                return;
+            }
+
             if (!workspace.workspaceFolders || workspace.workspaceFolders.length === 0) {
+                this.channel.appendLine('[keil-assistant] sync: workspaceFolders 为空，跳过');
+
                 return;
             }
 
             if (this.prjList.size === 0) {
+                this.channel.appendLine('[keil-assistant] sync: prjList 为空，跳过（工程还没加载）');
+
                 return;
             }
 
             const norm = (p: string) => normalize(p).replace(/\\/g, '/').toLowerCase();
+            const processMode = resMgr.getProcessMode();
+            const addStrategy = resMgr.getAddStrategy();
+            const missingPaths: string[] = [];
 
-            // 第一步：为每个工程的活动 Target 创建虚拟目录
-            const virtualDirsToAdd: string[] = [];
+            this.channel.appendLine(
+                `[keil-assistant] sync: prjCount=${this.prjList.size}, processMode=${processMode}, addStrategy=${addStrategy}, workspaceFolders=${workspace.workspaceFolders.length}`
+            );
+            this.channel.appendLine(
+                `[keil-assistant] sync: 当前工作区 folders: ${workspace.workspaceFolders.map(f => f.uri.fsPath).join(' || ')}`
+            );
+
+            // 2) 解析每个工程待处理 Target 的文件计划（纯读取，无磁盘写入）
+            const plansByPrj = new Map<string, {
+                prj: KeilProject;
+                targets: { target: PTarget; plan: { group: string; files: string[] }[] }[];
+            }>();
 
             for (const prj of this.prjList.values()) {
-                const target = prj.getActiveTarget();
+                const targets = processMode === 'allTargets'
+                    ? prj.getTargets()
+                    : (prj.getActiveTarget() ? [prj.getActiveTarget()!] : []);
 
-                if (!target) continue;
-                const vDir = this.createVirtualTargetDirs(prj, target);
-
-                if (vDir) virtualDirsToAdd.push(vDir);
+                plansByPrj.set(prj.prjID, {
+                    prj,
+                    targets: targets.map(t => ({ target: t, plan: this.collectTargetPlan(t, missingPaths) })),
+                });
             }
 
-            // 第二步：收集物理源码目录（作为 fallback 或补充）
-            const sourceDirs = this.collectActiveTargetSourceDirs();
-            const dirArray = Array.from(sourceDirs);
+            // 缺失文件提示（去重，最多展示 10 条）
+            if (missingPaths.length > 0) {
+                const uniqueMissing = Array.from(new Set(missingPaths));
+                const preview = uniqueMissing.slice(0, 10);
 
-            // 计算最小物理目录集合
-            const minimalDirs = dirArray.filter(dir => {
-                const d = norm(dir);
+                this.channel.appendLine(
+                    `[keil-assistant] 发现 ${uniqueMissing.length} 个工程引用但实际不存在的文件：\n  ${preview.join('\n  ')}${uniqueMissing.length > 10 ? '\n  ...' : ''}`
+                );
+            }
 
-                return !dirArray.some(other => {
-                    const o = norm(other);
+            // 3) 汇总"物理目录 → 其下源文件集合"，用于判断虚拟树是否已完整覆盖该目录
+            const filesByDir = new Map<string, Set<string>>();
 
-                    return o !== d && d.startsWith(o + '/');
-                });
-            });
+            for (const { targets } of plansByPrj.values()) {
+                for (const { plan } of targets) {
+                    for (const g of plan) {
+                        for (const f of g.files) {
+                            const dirLower = norm(dirname(f));
+                            let set = filesByDir.get(dirLower);
 
-            // 第三步：计算最终需要加入的目录
-            // 虚拟目录优先：虚拟 Target 目录覆盖了其下所有源码文件所在物理目录 → 可以 skip 这些物理目录
-            const virtualPathsLower = new Set(virtualDirsToAdd.map(norm));
-
-            const targetPhysicalDirs = minimalDirs.filter(dir => {
-                const dirLower = norm(dir);
-
-                // 如果某个虚拟目录是该物理目录的祖先或相同，则物理目录被覆盖
-                for (const vp of virtualPathsLower) {
-                    if (dirLower === vp || dirLower.startsWith(vp + '/')) {
-                        return false;
+                            if (!set) {
+                                set = new Set();
+                                filesByDir.set(dirLower, set);
+                            }
+                            set.add(norm(f));
+                        }
                     }
                 }
-                return true;
-            });
+            }
 
-            const targetAllDirs = [...virtualDirsToAdd, ...targetPhysicalDirs].map(norm);
-            const targetSet = new Set(targetAllDirs);
+            // 4) 构建虚拟目录树（virtualSymlink 策略）
+            const virtualFolders: { path: string; name: string }[] = [];
+            const linkedFiles = new Set<string>();
 
-            // 第四步：与当前 managed 集合计算差集
+            if (addStrategy === 'virtualSymlink') {
+                let anyLinked = false;
+
+                for (const { prj, targets } of plansByPrj.values()) {
+                    const state = this.buildVirtualTree(prj, targets, norm);
+
+                    if (state && state.linked.size > 0) {
+                        state.linked.forEach(f => linkedFiles.add(f));
+                        anyLinked = true;
+                    }
+                }
+                // 所有工程共用一个 JCVM 虚拟根，成功创建至少一个 symlink 就把它加入工作区
+                if (anyLinked) {
+                    virtualFolders.push({ path: this.virtualStorageRoot, name: 'JCVM' });
+                }
+            } else if (this.virtualStateByPrj.size > 0) {
+                // 已切到 minimalCommonRoot 策略 → 清理旧的虚拟树
+                this.cleanupVirtualDirs();
+            }
+
+            // 5) 计算最小物理目录集合（去掉被祖先覆盖的子目录）
+            const physicalDirs = Array.from(filesByDir.keys());
+            const minimalDirs = physicalDirs.filter(d => !physicalDirs.some(o => o !== d && d.startsWith(o + '/')));
+
+            // 6) 决定要加入工作区的目录
+            //    虚拟树完整覆盖 + 搜索会跟随符号链接 → 跳过物理目录，避免同一文件出现两条搜索结果；
+            //    否则保留物理目录，确保 Ctrl+Shift+F 一定能搜到（例如 symlink 创建失败、或用户关闭了 followSymlinks）。
+            const followSymlinks = workspace.getConfiguration('search').get<boolean>('followSymlinks', true);
+            const dirsToAdd: { path: string; name: string }[] = [...virtualFolders];
+            let skippedPhysicalCount = 0;
+
+            for (const dir of minimalDirs) {
+                const files = filesByDir.get(dir) ?? new Set<string>();
+                const fullyLinked = addStrategy === 'virtualSymlink' && followSymlinks &&
+                    files.size > 0 && Array.from(files).every(f => linkedFiles.has(f));
+
+                if (fullyLinked) {
+                    skippedPhysicalCount++;
+                    continue;
+                }
+                dirsToAdd.push({ path: dir, name: basename(dir) });
+            }
+
+            if (skippedPhysicalCount > 0 && followSymlinks) {
+                this.channel.appendLine(
+                    `[keil-assistant] ${skippedPhysicalCount} 个物理源码目录已被虚拟层级完整覆盖，未重复加入工作区（避免搜索结果重复）。`
+                );
+            }
+
+            if (!followSymlinks && addStrategy === 'virtualSymlink' && minimalDirs.length > 0) {
+                this.channel.appendLine(
+                    '[keil-assistant] 检测到 search.followSymlinks 已关闭：符号链接中的文件不会被 Ctrl+Shift+F 搜索，已改为同时加入物理源码目录。建议开启该设置以获得去重后的搜索结果。'
+                );
+            }
+
+            // 7) 与 managed 集合求差集
+            //    注意：VS Code 重启后 managedFolderPaths 会丢失，因此把位于扩展存储目录下的虚拟根也视为"本插件所有"，
+            //    否则旧会话残留的虚拟目录既不会被清理、也会让本次同步误判为"已被外部目录覆盖"
+            const targetSet = new Set(dirsToAdd.map(d => norm(d.path)));
+            const virtualStoragePrefix = `${norm(this.virtualStorageRoot)}/`;
+            const ours = new Set(this.managedFolderPaths);
+
+            for (const f of workspace.workspaceFolders) {
+                const p = norm(f.uri.fsPath);
+
+                if (p.startsWith(virtualStoragePrefix)) ours.add(p);
+            }
+
             const externalPaths = workspace.workspaceFolders
                 .map(f => norm(f.uri.fsPath))
-                .filter(p => !this.managedFolderPaths.has(p));
+                .filter(p => !ours.has(p));
 
             const toRemove: string[] = [];
-            const toAdd: { uri: Uri; name: string; path: string }[] = [];
+            const toAdd: { uri: Uri; name: string; path: string; isVirtual: boolean }[] = [];
 
-            for (const p of this.managedFolderPaths) {
+            for (const p of ours) {
                 if (!targetSet.has(p)) toRemove.push(p);
             }
 
-            const managedCopy = new Set(this.managedFolderPaths);
+            const managedCopy = new Set(ours);
 
-            for (const dir of [...virtualDirsToAdd, ...targetPhysicalDirs]) {
-                const dirLower = norm(dir);
+            for (const dir of dirsToAdd) {
+                const dirLower = norm(dir.path);
 
-                // 被外部已有目录覆盖的 skip
+                // 已被外部（用户自带）工作区文件夹覆盖 → 不重复添加
                 if (externalPaths.some(ep => dirLower === ep || dirLower.startsWith(ep + '/'))) continue;
+
+                // 已被更上层的待添加目录覆盖（如物理目录位于另一个物理目录之下）→ 跳过
+                if (dirsToAdd.some(other => {
+                    const o = norm(other.path);
+
+                    return o !== dirLower && dirLower.startsWith(o + '/');
+                })) continue;
+
                 if (!managedCopy.has(dirLower)) {
-                    toAdd.push({ uri: Uri.file(dir), name: basename(dir), path: dirLower });
+                    toAdd.push({
+                        uri: Uri.file(dir.path),
+                        name: dir.name,
+                        path: dirLower,
+                        isVirtual: virtualFolders.some(v => norm(v.path) === dirLower),
+                    });
                 }
             }
 
-            // 一致性短路
+            // 幂等短路：无变更时什么都不做
             if (toRemove.length === 0 && toAdd.length === 0) {
                 return;
             }
 
-            // 第五步：先删除，再追加
+            // 8) 用户确认（可选）
+            if (toAdd.length > 0 && resMgr.isConfirmBeforeAdd()) {
+                const confirmMsg = `Keil Assistant 将把以下 ${toAdd.length} 个外部源码目录加入工作区：\n${toAdd.map(a => `  ${a.path}`).join('\n')}`;
+                const result = await window.showInformationMessage(confirmMsg, '确认', '取消');
+
+                if (result !== '确认') {
+                    this.channel.appendLine('[keil-assistant] 用户取消了外部源码目录加入。');
+
+                    return;
+                }
+            }
+
+            // 9) 先按索引倒序精准移除过期条目（保留用户原有工作区文件夹）
             if (toRemove.length > 0) {
                 const allFolders = workspace.workspaceFolders;
 
@@ -350,20 +611,35 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                 }
             }
 
+            // 10) 追加新增条目
             if (toAdd.length > 0) {
-                const ok = workspace.updateWorkspaceFolders(workspace.workspaceFolders.length, 0, ...toAdd);
+                const folders = workspace.workspaceFolders;
+                const newEntries = toAdd.map(a => ({ uri: a.uri, name: a.name }));
+                const insertIndex = folders ? folders.length : 0;
+
+                this.channel.appendLine(
+                    `[keil-assistant] sync: 调用 updateWorkspaceFolders(${insertIndex}, 0, ${newEntries.length} 个)`
+                );
+
+                const ok = folders
+                    ? workspace.updateWorkspaceFolders(insertIndex, 0, ...newEntries)
+                    : false;
+
+                this.channel.appendLine(`[keil-assistant] sync: updateWorkspaceFolders 返回 ${ok}`);
 
                 if (ok) {
                     for (const item of toAdd) this.managedFolderPaths.add(item.path);
-                    const vCount = toAdd.filter(a => virtualPathsLower.has(a.path)).length;
+                    const vCount = toAdd.filter(a => a.isVirtual).length;
                     this.channel.appendLine(
-                        `[keil-assistant] 已同步工作区文件夹：新增 ${toAdd.length} 个 (虚拟 ${vCount} + 物理 ${toAdd.length - vCount}), 移除 ${toRemove.length} 个。`
+                        `[keil-assistant] 已同步工作区文件夹：新增 ${toAdd.length} 个（虚拟层级 ${vCount} + 物理源码 ${toAdd.length - vCount}），移除 ${toRemove.length} 个。`
                     );
                 } else {
-                    this.channel.appendLine(`[keil-assistant] 追加源码目录到工作区失败。`);
+                    this.channel.appendLine('[keil-assistant] 追加源码目录到工作区失败！');
                 }
             } else if (toRemove.length > 0) {
                 this.channel.appendLine(`[keil-assistant] 已同步工作区文件夹：移除 ${toRemove.length} 个。`);
+            } else {
+                this.channel.appendLine('[keil-assistant] syncWorkspaceFolders END（无变更，幂等短路）');
             }
         } finally {
             this.isSyncing = false;
@@ -391,6 +667,14 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
         return [];
     }
+
+    /** 命令入口：手动触发一次工作区同步（方便用户排障） */
+    public async syncNow(): Promise<void> {
+        this.channel.show();
+        this.channel.appendLine('[keil-assistant] 用户命令触发 syncWorkspaceFolders');
+        await this.syncWorkspaceFolders();
+    }
+
     async loadWorkspace() {
         this.channel.show();
         if (!workspace.workspaceFolders || workspace.workspaceFolders.length === 0) {
@@ -524,8 +808,14 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         if (nPrj) {
             if (!this.prjList.has(nPrj.prjID)) {
 
+                // 【修复】先注册 dataChanged 监听，再 load：load() 内部会触发 notifyUpdateView() 发 dataChanged，
+                // 如果注册在 load 之后，首次加载的事件就没人接，scheduleSync 也就不会被触发。
+                nPrj.on('dataChanged', () => {
+                    this.updateView();
+                    this.scheduleSync();
+                });
+
                 await nPrj.load();
-                nPrj.on('dataChanged', () => this.updateView());
                 this.prjList.set(nPrj.prjID, nPrj);
 
                 if (this.curActiveProject === undefined) {
@@ -534,8 +824,8 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                 }
 
                 this.updateView();
-                // 工程加载后触发 syncWorkspaceFolders（虚拟目录 + 工作区文件夹同步）
-                void this.syncWorkspaceFolders();
+                // 工程加载完成后立即触发一次同步（不用等 debounce，确保自动生效）
+                this.scheduleSync();
 
                 return nPrj;
             }
@@ -555,7 +845,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             this.cleanupVirtualDirs(prj);
             this.updateView();
             // 关闭工程后重新同步工作区文件夹
-            void this.syncWorkspaceFolders();
+            this.scheduleSync();
         }
     }
 
@@ -568,7 +858,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         this.curActiveProject = project;
         this.updateView();
         // 激活工程后重新同步工作区文件夹
-        void this.syncWorkspaceFolders();
+        this.scheduleSync();
 
     }
 
@@ -590,7 +880,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             if (targetName) {
                 prj.setActiveTarget(targetName);
                 // 切换 Target 后重新同步工作区文件夹（重建虚拟目录）
-                void this.syncWorkspaceFolders();
+                this.scheduleSync();
             }
         }
     }
@@ -606,7 +896,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             if (targetName) {
                 this.curActiveProject?.setActiveTarget(targetName);
                 // 切换 Target 后重新同步工作区文件夹
-                void this.syncWorkspaceFolders();
+                this.scheduleSync();
             }
         }
     }

@@ -148,4 +148,39 @@ export class ResourceManager {
 
         return depth ?? 1;
     }
+
+    /**
+     * 是否自动将工程引用的外部源码加入 VS Code 工作区
+     */
+    public isAutoAddExternalSources(): boolean {
+        return this.getAppConfig().get<boolean>('Workspace.AutoAddExternalSources') ?? true;
+    }
+
+    /**
+     * 处理模式：'activeTarget' 仅活动 Target，'allTargets' 所有 Target 去重合并
+     */
+    public getProcessMode(): 'activeTarget' | 'allTargets' {
+        const mode = this.getAppConfig().get<string>('Workspace.ProcessMode');
+
+        return mode === 'allTargets' ? 'allTargets' : 'activeTarget';
+    }
+
+    /**
+     * 外部源码加入工作区的策略
+     * - 'virtualSymlink': 统一 JCVM 虚拟根 + symlink，按 工程名/TargetName/GroupName 层级组织（默认）
+     *   需要 Windows 开发者模式或管理员权限
+     * - 'minimalCommonRoot': 最小公共根目录直接加入，扁平显示，不按 GroupName 分组
+     */
+    public getAddStrategy(): 'virtualSymlink' | 'minimalCommonRoot' {
+        const strategy = this.getAppConfig().get<string>('Workspace.AddStrategy');
+
+        return strategy === 'minimalCommonRoot' ? 'minimalCommonRoot' : 'virtualSymlink';
+    }
+
+    /**
+     * 是否需要用户确认后再加入工作区
+     */
+    public isConfirmBeforeAdd(): boolean {
+        return this.getAppConfig().get<boolean>('Workspace.ConfirmBeforeAdd') ?? false;
+    }
 }

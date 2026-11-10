@@ -76,6 +76,11 @@ export function activate(context: ExtensionContext) {
         void prjExplorer.statusBarSwitchTargetByProject();
     }));
 
+    // 手动触发工作区同步，方便排障：命令面板里输入 "Keil: Sync Workspace Folders"
+    subscriber.push(commands.registerCommand('workspace.sync', () => {
+        void prjExplorer.syncNow();
+    }));
+
     subscriber.push(commands.registerCommand('project.generateCompileCommandsJson',
         (item: IView) => prjExplorer.getTarget(item)?.updateCompileCommands()
     ));

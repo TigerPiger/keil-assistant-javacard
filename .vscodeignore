@@ -28,6 +28,8 @@ dist/test/**
 
 # no project scripts
 .scripts/**
+*.bat
+*.cmd
 
 # ignore ts files in ui
 ui/*.ts

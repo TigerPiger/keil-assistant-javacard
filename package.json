@@ -142,6 +142,40 @@
             "scope": "resource",
             "markdownDescription": "%keil-assistant.contributes.conf.props.project.FindMaxDepth.description%",
             "default": 1
+          },
+          "KeilAssistant.Workspace.AutoAddExternalSources": {
+            "type": "boolean",
+            "scope": "window",
+            "markdownDescription": "%keil-assistant.contributes.conf.props.workspace.autoAddExternalSources.description%",
+            "default": true
+          },
+          "KeilAssistant.Workspace.ProcessMode": {
+            "type": "string",
+            "enum": ["activeTarget", "allTargets"],
+            "enumDescriptions": [
+              "仅处理当前活动 Target 的源码文件",
+              "处理所有 Target 的源码文件（去重合并）"
+            ],
+            "scope": "window",
+            "markdownDescription": "%keil-assistant.contributes.conf.props.workspace.processMode.description%",
+            "default": "activeTarget"
+          },
+          "KeilAssistant.Workspace.AddStrategy": {
+            "type": "string",
+            "enum": ["virtualSymlink", "minimalCommonRoot"],
+            "enumDescriptions": [
+              "创建虚拟目录树 + 符号链接，按 JCVM/{TargetName}/{GroupName}/FileName 层级展示，Explorer 可见且 Ctrl+Shift+F 可全局搜索。需要 Windows 开发者模式或管理员权限（默认）",
+              "直接将外部源码的最小公共根目录加入工作区：不依赖额外权限，Ctrl+Shift+F 一定能搜索到，但 Explorer 里显示的是物理目录名（扁平，不按 GroupName 分组）"
+            ],
+            "scope": "window",
+            "markdownDescription": "%keil-assistant.contributes.conf.props.workspace.addStrategy.description%",
+            "default": "virtualSymlink"
+          },
+          "KeilAssistant.Workspace.ConfirmBeforeAdd": {
+            "type": "boolean",
+            "scope": "window",
+            "markdownDescription": "%keil-assistant.contributes.conf.props.workspace.confirmBeforeAdd.description%",
+            "default": false
           }
         }
       }
@@ -210,6 +244,10 @@
       {
         "command": "project.generateCompileCommandsJson",
         "title": "%keil-assistant.contributes.commands.project-generateCompileCommandsJson%"
+      },
+      {
+        "command": "workspace.sync",
+        "title": "Keil: Sync Workspace Folders"
       }
     ],
     "menus": {

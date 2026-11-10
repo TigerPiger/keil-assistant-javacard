@@ -157,6 +157,17 @@ export class ResourceManager {
     }
 
     /**
+     * JCRE 源码根目录（KeilAssistant.Keil.JCRE）。
+     * 插件扫描 mask.c 中 class@ 注释引用的 javacard API，并在该路径下查找对应的 .java 文件放入虚拟根。
+     * 空字符串表示不启用 JCRE 扫描。
+     */
+    public getJcrePath(): string {
+        const p = (this.getAppConfig().get<string>('Keil.JCRE') ?? '').trim();
+
+        return p;
+    }
+
+    /**
      * 处理模式：'activeTarget' 仅活动 Target，'allTargets' 所有 Target 去重合并
      */
     public getProcessMode(): 'activeTarget' | 'allTargets' {

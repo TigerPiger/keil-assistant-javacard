@@ -115,6 +115,11 @@
               "MDK": "C:\\Keil_v5"
             }
           },
+          "KeilAssistant.Keil.JCRE": {
+            "type": "string",
+            "markdownDescription": "**Java Card 运行时环境（JCRE）源码根目录**。\n\n插件会扫描工程中所有 `mask.c`，识别形如 `/* class@... interface javacard/security/SecretKey */` 的注释，然后在这个路径下查找对应的 `.java` 文件（例如 `javacard/security/SecretKey.java`），并以树形 symlink 放入统一虚拟根的 `JCRE/` 子目录中，让 `Ctrl+Shift+F` 能搜到这些标准 API 源码。\n\n示例：`C:\\PersonalData\\gitRepos\\javacard-api\\src`\n\n留空则不扫描 JCRE。",
+            "default": ""
+          },
           "KeilAssistant.Project.ExcludeList": {
             "type": "array",
             "scope": "resource",

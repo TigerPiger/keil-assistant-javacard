@@ -20,15 +20,26 @@ export function activate(context: ExtensionContext) {
     myStatusBarItem = window.createStatusBarItem(StatusBarAlignment.Left, 200);
     myStatusBarItem.command = 'statusbar.project';
 
-    const testKeilRoot = ResourceManager.getInstance(context).getKeilRootDir("MDK");
+    // 检查 Keil 根目录是否存在。
+    // 注意：这个检查是"尽力而为"——如果用户没配好 Keil.HOME 或路径无效，我们只记日志，
+    // 不去弹 errorMessage 打断用户流程（不影响 workspace sync 这类不依赖 Keil 路径的功能）。
+    try {
+        const testKeilRoot = ResourceManager.getInstance(context).getKeilRootDir("MDK");
 
-    stat(testKeilRoot, (err, stat) => {
-        if (err || !stat.isDirectory()) {
-            channel.show();
-            channel.appendLine(`Error: Please set keil root Path, ${err}`);
-            window.showErrorMessage(`Error: Please set keil root Path, ${err}`);
-        }
-    });
+        stat(testKeilRoot, (err, stat) => {
+            if (err || !stat.isDirectory()) {
+                // 路径可能带了引号/空格等脏字符，先 trim 一下再提示
+                const cleaned = testKeilRoot?.replace(/^["']|["']$/g, '') ?? '';
+
+                channel.appendLine(
+                    `[keil-assistant] Keil.HOME 路径无效: ${testKeilRoot}（尝试清理后: ${cleaned}）。` +
+                    `Keil 构建/下载功能不可用，但 workspace sync 不受影响。`
+                );
+            }
+        });
+    } catch (err) {
+        channel.appendLine(`[keil-assistant] getKeilRootDir 调用异常: ${err}`);
+    }
 
     const prjExplorer = new ProjectExplorer(context, channel, myStatusBarItem);
     const subscriber = context.subscriptions;

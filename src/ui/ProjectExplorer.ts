@@ -1,5 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
-import { statSync, readFileSync, readdirSync, mkdirSync, symlinkSync, rmSync, existsSync } from "fs";
+import { statSync, readFileSync, readdirSync, mkdirSync, symlinkSync, linkSync, rmSync, existsSync } from "fs";
 import { basename, dirname, extname, join, normalize, resolve, sep } from "path";
 import type {
     Event, ExtensionContext, ProviderResult, TreeDataProvider,
@@ -36,11 +36,13 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
     private isSyncing = false;
     // 事件 debounce 定时器，合并短时间内多次 onDidChangeWorkspaceFolders 触发
     private syncDebounceTimer: ReturnType<typeof setTimeout> | undefined;
-    // 虚拟工作区统一根目录：一个固定的 JCVM，里面按 工程名/TargetName/GroupName 组织所有源码符号链接
-    // 放在扩展全局存储中，绝不写入用户的工程目录
+    // 虚拟工作区统一根目录：放在扩展全局存储中，绝不写入用户的工程目录
+    // 内部并列两个子目录：JCVM/（工程源码 symlink）和 JCRE/（Java Card 运行时 API symlink）
     private virtualStorageRoot: string;
-    // 每个工程上一次生成的虚拟树状态：signature 未变化时直接复用，避免无谓的删除/重建
+    // 每个工程上一次生成的 JCVM 源码虚拟树状态
     private virtualStateByPrj: Map<string, { prjSubdir: string; signature: string; linked: Set<string> }> = new Map();
+    // 每个工程上一次生成的 JCRE 虚拟树状态
+    private jcreStateByPrj: Map<string, { prjSubdir: string; signature: string; linked: Set<string> }> = new Map();
     // 当前环境是否支持创建符号链接（探测到 EPERM 后置为 true，不再重复尝试）
     private symlinkUnsupported = false;
 
@@ -49,9 +51,21 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         this.viewEvent = new EventEmitter();
         this.onDidChangeTreeData = this.viewEvent.event;
         this.workspacePath = '';
-        // 虚拟符号链接统一根：固定命名为 JCVM，所有工程的符号链接都放在这里
-        // 路径位于扩展全局存储中，绝不写入用户工程目录
-        this.virtualStorageRoot = join(context.globalStorageUri.fsPath, 'keil-workspace', 'JCVM');
+        // 虚拟符号链接统一根：放在扩展全局存储里，下面并列 JCVM/ 和 JCRE/ 两个子目录
+        // 这样一个 workspace folder 就同时暴露两类虚拟内容，不污染工程目录
+        this.virtualStorageRoot = join(context.globalStorageUri.fsPath, 'keil-workspace');
+        this.channel.appendLine(
+            `[keil-assistant] ProjectExplorer 构造: globalStorageUri=${context.globalStorageUri.fsPath}, virtualStorageRoot=${this.virtualStorageRoot}`
+        );
+        // 同时输出已安装的插件版本号，确认用户跑的是最新包
+        try {
+            const pkgJsonPath = join(context.extensionPath, 'package.json');
+            const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
+
+            this.channel.appendLine(`[keil-assistant] 插件版本: ${pkgJson.version}`);
+        } catch {
+            /* 忽略 */
+        }
 
         context.subscriptions.push(window.registerTreeDataProvider('project', this));
         context.subscriptions.push(commands.registerCommand(this.itemClickCommand, (item: IView) => this.onItemClick(item)));
@@ -70,10 +84,17 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         }));
     }
 
-    /** 合并短时间内的多次同步请求，避免重复执行 */
+    /** 合并短时间内的多次同步请求，避免重复执行；防抖 300ms 后真正调用 syncWorkspaceFolders */
     private scheduleSync(): void {
+        this.channel.appendLine('[keil-assistant] scheduleSync: 防抖 300ms 后执行 syncWorkspaceFolders');
         if (this.syncDebounceTimer) clearTimeout(this.syncDebounceTimer);
-        this.syncDebounceTimer = setTimeout(() => { this.scheduleSync(); }, 300);
+        // 注意：setTimeout 回调里调 syncWorkspaceFolders（async），不能写成 scheduleSync 自己！
+        // 之前的 bug 是调了 this.scheduleSync()，导致无限递归 debounce，syncWorkspaceFolders 永远不执行
+        this.syncDebounceTimer = setTimeout(() => {
+            this.syncWorkspaceFolders().catch(err => {
+                this.channel.appendLine(`[keil-assistant] syncWorkspaceFolders 异常: ${err}`);
+            });
+        }, 300);
     }
 
     // ========== 虚拟工作区 & 工作区同步 相关方法 ==========
@@ -160,16 +181,25 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         // 已知当前环境不支持符号链接 → 直接跳过虚拟树，走物理目录兜底
         if (this.symlinkUnsupported) return undefined;
 
-        // 统一虚拟根：固定叫 JCVM，整个应用生命周期里只建一次
-        const jcvmRoot = this.virtualStorageRoot;
+        // 虚拟根下并列 JCVM/ 和 JCRE/ 两个子目录
+        const jcvmRoot = join(this.virtualStorageRoot, 'JCVM');
         const prjSubdir = this.sanitizeDirName(prj.label);
         const prjRoot = join(jcvmRoot, prjSubdir);
 
         const signature = JSON.stringify(targets.map(t => [t.target.targetName, t.plan]));
         const prev = this.virtualStateByPrj.get(prj.prjID);
 
+        const totalFiles = targets.reduce((sum, t) => sum + t.plan.reduce((s, g) => s + g.files.length, 0), 0);
+        this.channel.appendLine(
+            `[keil-assistant] JCVM 构建开始: prj=${prj.label}, Targets=[${targets.map(t => t.target.targetName).join(',')}], 文件总数=${totalFiles}`
+        );
+
         // 内容没变且子目录还在 → 直接复用，不做任何磁盘操作
         if (prev && prev.signature === signature && existsSync(prjRoot)) {
+            this.channel.appendLine(
+                `[keil-assistant] JCVM 签名未变化，复用上次结果（${prev.linked.size} 个 symlink，路径 ${prjRoot}）`
+            );
+
             return { linked: prev.linked };
         }
 
@@ -233,37 +263,45 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                     } catch (err) {
                         const code = (err as NodeJS.ErrnoException).code;
 
-                        // 权限类错误说明当前环境根本不支持符号链接（Windows 未开启开发者模式/非管理员）
-                        // → 立即放弃整个虚拟树，避免对成百上千个文件逐个失败
+                        // 权限类错误说明 symlink 不可用 → 回退 hardlink
                         if (code === 'EPERM' || code === 'EACCES' || code === 'UNKNOWN') {
-                            aborted = true;
-                            break;
+                            try {
+                                linkSync(realPath, linkPath);
+                                linked.add(norm(realPath));
+                                // hardlink 静默成功，不刷屏（JCVM 可能有大量文件）
+                            } catch (err2) {
+                                // hardlink 也失败 → 完全放弃，降级 junction
+                                this.channel.appendLine(
+                                    `[keil-assistant] JCVM symlink+hardlink 均失败 ${basename(realPath)}: ${(err2 as NodeJS.ErrnoException).code || (err2 as Error).message} —— 降级 junction`
+                                );
+                                aborted = true;
+                                break;
+                            }
+                        } else {
+                            failedCount++;
                         }
-                        failedCount++;
                     }
                 }
             }
         }
 
-        // 环境不支持符号链接：清掉半成品，标记后不再尝试
+        // symlink + hardlink 均失败：清掉半成品，降级到 junction（目录联接，普通用户权限即可）
+        // junction 是 NTFS Reparse Point，指向整个目录，VS Code 完全透明
+        // 注意：不再设置全局 symlinkUnsupported，因为 JCRE 有自己的 hardlink 回退机制，两者独立工作
         if (aborted) {
+            this.channel.appendLine(
+                '[keil-assistant] symlink+hardlink 均失败，自动降级到 junction（目录联接）—— 无需管理员/开发者模式'
+            );
             try { rmSync(prjRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
-            // 如果 JCVM 根已经空了，也一并删掉，保持干净
-            try {
-                if (existsSync(jcvmRoot) && readdirSync(jcvmRoot).length === 0) {
-                    rmSync(jcvmRoot, { recursive: true, force: true });
-                }
-            } catch { /* 忽略 */ }
             this.virtualStateByPrj.delete(prj.prjID);
-            this.symlinkUnsupported = true;
-            const tip = '无法创建符号链接（EPERM）。请在 Windows 设置 → 隐私和安全性 → 开发者选项 里开启「开发人员模式」，或让 VS Code 以管理员身份运行。开启后重启 VS Code 再执行一次 "Keil: Sync Workspace Folders"。当前将自动切换到 minimalCommonRoot 扁平策略，Ctrl+Shift+F 全局搜索不受影响。';
+            // this.symlinkUnsupported = true; // 不再设置，不影响 JCRE 的 hardlink 回退
 
-            this.channel.appendLine(`[keil-assistant] ${tip}`);
-            window.showInformationMessage(`Keil Assistant: ${tip}`);
-
-            return undefined;
+            // junction 模式：按 Group 的物理目录聚合，每个物理目录建一个 junction
+            // MH1701 实测 11 个 Group 全是单物理目录，junction 模式完美覆盖
+            return this.buildVirtualTreeByJunction(prj, targets, norm, jcvmRoot, prjRoot);
         }
 
+        // --- symlink 成功的正常路径 ---
         this.virtualStateByPrj.set(prj.prjID, { prjSubdir, signature, linked });
 
         if (failedCount > 0) {
@@ -279,17 +317,505 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
     }
 
     /**
+     * junction 模式：按 Group 的物理目录聚合，每个物理目录建一个 junction（目录联接）。
+     *
+     * junction 是 NTFS Reparse Point，普通用户权限即可创建（无需开发者模式/管理员）。
+     * VS Code 完全透明：Explorer 里直接展开真实目录内容，Ctrl+Shift+F 能搜到，
+     * 在虚拟树里编辑就是直接编辑原文件（junction 透明转发所有文件系统操作）。
+     *
+     * 适用于 symlink 权限不足时的自动降级路径。
+     * MH1701 实测 11 个 Group 全是单物理目录 → 完美覆盖，一个 junction 代替 N 个 symlink。
+     */
+    private buildVirtualTreeByJunction(
+        prj: KeilProject,
+        targets: { target: PTarget; plan: { group: string; files: string[] }[] }[],
+        norm: (p: string) => string,
+        jcvmRoot: string,
+        prjRoot: string,
+    ): { linked: Set<string> } | undefined {
+        this.channel.appendLine('[keil-assistant] JCVM junction 降级开始（无需管理员权限）');
+
+        // 确保 jcvmRoot 存在（调用方可能没建）
+        try { mkdirSync(jcvmRoot, { recursive: true }); } catch { /* 忽略 */ }
+        try { mkdirSync(prjRoot, { recursive: true }); } catch (err) {
+            this.channel.appendLine(`[keil-assistant] junction 创建 prjRoot 失败: ${prjRoot}, msg: ${(err as Error).message}`);
+            return undefined;
+        }
+
+        const linked = new Set<string>();
+        const junctionList: string[] = [];
+
+        for (const { target, plan } of targets) {
+            const targetDir = join(prjRoot, this.sanitizeDirName(target.targetName));
+
+            try { mkdirSync(targetDir, { recursive: true }); } catch { continue; }
+
+            for (const g of plan) {
+                // 1) 把该 Group 的文件按物理目录分桶
+                const dirBuckets = new Map<string, string[]>();
+
+                for (const file of g.files) {
+                    const realDir = dirname(file);
+
+                    if (!dirBuckets.has(realDir)) dirBuckets.set(realDir, []);
+                    dirBuckets.get(realDir)!.push(file);
+                }
+
+                // 2) 每个物理目录建一个 junction，挂到 Target 目录下
+                //    junction 名 = 物理目录的 basename；冲突时用 GroupName 前缀
+                const usedNames = new Set<string>();
+                let bucketIdx = 0;
+
+                for (const [realDir, files] of dirBuckets) {
+                    if (!existsSync(realDir)) continue; // 真实目录不存在则跳过
+
+                    let junctionName = basename(realDir);
+
+                    if (usedNames.has(junctionName)) {
+                        // 冲突 → 用 GroupName 前缀
+                        junctionName = `${this.sanitizeDirName(g.group)}_${junctionName}`;
+                    }
+                    // 单目录且 GroupName == basename → 直接用 GroupName（更直观）
+                    if (dirBuckets.size === 1) {
+                        const groupName = this.sanitizeDirName(g.group);
+
+                        if (!usedNames.has(groupName)) junctionName = groupName;
+                    }
+                    usedNames.add(junctionName);
+
+                    const junctionPath = join(targetDir, junctionName);
+
+                    if (existsSync(junctionPath)) {
+                        // 已存在且是 junction → 清理了重建（避免残留脏 junction）
+                        try { rmSync(junctionPath, { recursive: true, force: true }); } catch { /* 忽略 */ }
+                    }
+
+                    try {
+                        symlinkSync(realDir, junctionPath, 'junction');
+                        junctionList.push(junctionName);
+                        for (const f of files) linked.add(norm(f));
+                    } catch (err) {
+                        const code = (err as NodeJS.ErrnoException).code;
+
+                        if (code === 'EPERM' || code === 'EACCES') {
+                            this.channel.appendLine(
+                                `[keil-assistant] junction 也没权限（EPERM），完全无权限环境——跳过虚拟树，走 minimalCommonRoot 兜底`
+                            );
+                            // 清掉已建的 junction 半成品
+                            try { rmSync(prjRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
+                            this.virtualStateByPrj.delete(prj.prjID);
+
+                            return undefined;
+                        }
+                        this.channel.appendLine(
+                            `[keil-assistant] junction 失败 ${realDir} → ${junctionName}: ${code || (err as Error).message}`
+                        );
+                    }
+                    bucketIdx++;
+                }
+            }
+        }
+
+        if (linked.size === 0) {
+            this.channel.appendLine('[keil-assistant] junction 模式：0 个成功，跳过虚拟树。');
+            return undefined;
+        }
+
+        const prjSubdir = this.sanitizeDirName(prj.label);
+        const signature = JSON.stringify(['junction', ...targets.map(t => [t.target.targetName, t.plan])]);
+        this.virtualStateByPrj.set(prj.prjID, { prjSubdir, signature, linked });
+
+        this.channel.appendLine(
+            `[keil-assistant] JCVM junction 完成: prj=${prj.label}, ${junctionList.length} 个 junction, 暴露 ${linked.size} 个文件`
+        );
+
+        return { linked };
+    }
+
+    // ==================== JCRE 相关 ====================
+
+    /**
+     * 扫描工程中所有 mask.c 文件，从 class@ 注释里抽取引用的 Java Card 标准 API 类名。
+     * 正则匹配形如（C 注释块内）：
+     *   class@0x00828cb4:0x0001: public abstract interface javacard/security/SecretKey
+     *   class@...: public class visa/openplatform/ProviderSecurityDomain
+     * 返回去重后的完整类名集合（包路径用 / 分隔）。
+     */
+    private scanMaskClasses(prj: KeilProject): { classes: string[]; maskFiles: string[] } {
+        const classes = new Set<string>();
+        const maskFiles: string[] = [];
+
+        // 遍历所有 Target → Group → Source，找文件名是 mask.c 的
+        const targets = prj.getActiveTarget() ? [prj.getActiveTarget()!] : prj.getTargets();
+
+        for (const target of targets) {
+            const groups = target.getChildViews() as FileGroup[] | undefined;
+
+            if (!groups) continue;
+            for (const group of groups) {
+                for (const source of group.sources) {
+                    if (!source.file.isFile()) continue;
+                    const name = basename(source.file.path).toLowerCase();
+
+                    if (!name.endsWith('.c')) continue;
+                    // 宽松匹配：只要文件名里含 mask 就扫（mask.c, mask_a51.c 等）
+                    if (!name.includes('mask')) continue;
+
+                    maskFiles.push(source.file.path);
+
+                    try {
+                        const content = readFileSync(source.file.path, 'utf-8');
+                        // class@...: 地址: [访问修饰符] [其他修饰符...] [class/interface] <全限定名>
+                        // 注意：实际 mask.c 注释格式灵活，有的省略了 class/interface 关键字，
+                        // 还可能出现 final/static/native 等修饰符，所以这里全部做成可选
+                        const re = /class@[^:]*:\s*0x[0-9a-fA-F]+:\s*(?:(?:public|private|protected)\s+)?(?:(?:abstract|final|native|static|synchronized|transient|strictfp)\s+)*(?:(?:interface|class)\s+)?([a-zA-Z_][\w/.]*)/g;
+                        let m: RegExpExecArray | null;
+
+                        while ((m = re.exec(content)) !== null) {
+                            classes.add(m[1]);
+                        }
+                    } catch (err) {
+                        this.channel.appendLine(
+                            `[keil-assistant] 读取 mask.c 失败 ${source.file.path}: ${(err as Error).message}`
+                        );
+                    }
+                }
+            }
+        }
+
+        return { classes: [...classes], maskFiles };
+    }
+
+    /**
+     * 构建 JCRE 源码虚拟树：
+     *   <virtualStorageRoot>/JCRE/{工程名}/{javacard/framework/AppletEvent.java} → symlink(JCRE/src/javacard/framework/AppletEvent.java)
+     *
+     * @returns 成功创建 symlink 的真实 .java 文件集合；undefined 表示跳过或完全没连上
+     */
+    private buildJcreTree(
+        prj: KeilProject,
+        jcrePath: string,
+        norm: (p: string) => string,
+    ): { linked: Set<string> } | undefined {
+        // JCRE 不再降级到 junction：junction 是目录级别的，会把整个包目录下所有 .java 都暴露出来
+        // （例如 mask.c 只引用了 CardException，但 OwnerPINx.java、package-info.java 也会出现）
+        // 这里改为始终尝试 symlink，symlink EPERM 时回退到 hardlink（NTFS 普通用户权限即可创建）
+        // hardlink 是文件级别的，能精确暴露 mask.c 引用的那些类
+
+        if (!jcrePath || !existsSync(jcrePath)) {
+            if (jcrePath) {
+                this.channel.appendLine(`[keil-assistant] Keil.JCRE 配置的路径不存在: ${jcrePath}`);
+            }
+
+            return undefined;
+        }
+
+        // 1) 扫描所有 mask.c，拿到类名
+        const { classes, maskFiles } = this.scanMaskClasses(prj);
+
+        if (maskFiles.length === 0) {
+            this.channel.appendLine(`[keil-assistant] ${prj.label}: 工程中未找到 mask.c，跳过 JCRE 扫描。`);
+
+            return undefined;
+        }
+
+        this.channel.appendLine(
+            `[keil-assistant] JCRE 构建开始: prj=${prj.label}, mask.c 数量=${maskFiles.length}, 扫描到 class/interface=${classes.length}, JCRE_SRC=${jcrePath}`
+        );
+
+        if (classes.length === 0) {
+            this.channel.appendLine(`[keil-assistant] ${prj.label}: mask.c 中未识别到任何 class@ 注释。`);
+
+            return undefined;
+        }
+
+        // 2) 在 JCRE 路径下定位 .java
+        const mappings: { cls: string; realPath: string }[] = [];
+        const missing: string[] = [];
+
+        for (const cls of classes) {
+            const javaPath = resolve(jcrePath, cls.replace(/\//g, sep) + '.java');
+
+            if (existsSync(javaPath) && statSync(javaPath).isFile()) {
+                mappings.push({ cls, realPath: javaPath });
+            } else {
+                missing.push(cls);
+            }
+        }
+
+        if (missing.length > 0) {
+            const preview = missing.slice(0, 5);
+
+            this.channel.appendLine(
+                `[keil-assistant] ${prj.label}/JCRE: ${missing.length}/${classes.length} 个类未找到 .java（${preview.join(', ')}${missing.length > 5 ? ' ...' : ''}）—— 可能是 visa/cn/com 等扩展，不影响标准 javacard.*`
+            );
+        }
+
+        if (mappings.length === 0) {
+            this.channel.appendLine(`[keil-assistant] ${prj.label}/JCRE: 0 个匹配，跳过。`);
+
+            return undefined;
+        }
+
+        // 3) 签名比对，没变化就复用
+        const prjSubdir = this.sanitizeDirName(prj.label);
+        const jcreRoot = join(this.virtualStorageRoot, 'JCRE');
+        const prjRoot = join(jcreRoot, prjSubdir);
+        const signature = mappings.map(m => m.cls).join('|');
+        const prev = this.jcreStateByPrj.get(prj.prjID);
+
+        if (prev && prev.signature === signature && existsSync(prjRoot)) {
+            this.channel.appendLine(
+                `[keil-assistant] JCRE 签名未变化，复用上次结果（${prev.linked.size} 个 symlink，路径 ${prjRoot}）`
+            );
+
+            return { linked: prev.linked };
+        }
+
+        // 4) 创建根目录
+        try {
+            if (!existsSync(jcreRoot)) mkdirSync(jcreRoot, { recursive: true });
+            if (existsSync(prjRoot)) rmSync(prjRoot, { recursive: true, force: true });
+            mkdirSync(prjRoot, { recursive: true });
+        } catch (err) {
+            this.channel.appendLine(`[keil-assistant] 创建 JCRE 虚拟目录失败: ${prjRoot}, msg: ${(err as Error).message}`);
+            this.jcreStateByPrj.delete(prj.prjID);
+
+            return undefined;
+        }
+
+        // 5) 按包路径创建目录并 symlink
+        const linked = new Set<string>();
+        let failedCount = 0;
+
+        for (const { cls, realPath } of mappings) {
+            // cls = javacard/framework/AppletEvent → 目录 javacard/framework/，文件名 AppletEvent.java
+            const parts = cls.split('/');
+            const fileName = parts.pop() + '.java';
+            const pkgDir = join(prjRoot, ...parts);
+
+            try {
+                mkdirSync(pkgDir, { recursive: true });
+            } catch (err) {
+                this.channel.appendLine(`[keil-assistant] 创建 JCRE 包目录失败 ${pkgDir}: ${(err as Error).message}`);
+                continue;
+            }
+
+            const linkPath = join(pkgDir, fileName);
+
+            try {
+                symlinkSync(realPath, linkPath, 'file');
+                linked.add(norm(realPath));
+            } catch (err) {
+                const code = (err as NodeJS.ErrnoException).code;
+
+                if (code === 'EPERM' || code === 'EACCES' || code === 'UNKNOWN') {
+                    // symlink 权限不足 → 回退到 hardlink
+                    // hardlink 在 NTFS 上普通用户权限即可创建，且是文件级别的
+                    // （不会像 junction 那样暴露整个包目录的无关文件）
+                    try {
+                        linkSync(realPath, linkPath);
+                        linked.add(norm(realPath));
+                        this.channel.appendLine(
+                            `[keil-assistant] JCRE symlink 失败（${code}），已回退到 hardlink: ${fileName}`
+                        );
+                    } catch (err2) {
+                        const code2 = (err2 as NodeJS.ErrnoException).code;
+                        // hardlink 可能失败：EXDEV（跨卷不支持）、EPERM/EACCES（权限）等
+                        this.channel.appendLine(
+                            `[keil-assistant] JCRE hardlink 也失败 ${fileName}: ${code2 || (err2 as Error).message} —— 跳过此文件`
+                        );
+                        failedCount++;
+                    }
+                } else {
+                    failedCount++;
+                }
+            }
+        }
+
+        // 清理空的 JCVM/JCRE 共用虚拟根
+        try {
+            if (existsSync(jcreRoot) && readdirSync(jcreRoot).length === 0) rmSync(jcreRoot);
+        } catch { /* 忽略 */ }
+
+        this.jcreStateByPrj.set(prj.prjID, { prjSubdir, signature, linked });
+
+        this.channel.appendLine(
+            `[keil-assistant] ${prj.label}/JCRE: 成功 ${linked.size}/${mappings.length} 个 Java Card API 源码 symlink（来自 ${maskFiles.length} 个 mask.c）`
+        );
+        if (failedCount > 0) {
+            this.channel.appendLine(`[keil-assistant] ${prj.label}/JCRE: ${failedCount} 个 symlink 创建失败。`);
+        }
+
+        return { linked };
+    }
+
+    /**
+     * JCRE junction 模式：按包根目录聚合，每个包根目录建一个 junction。
+     * 与 JCVM 同理，普通用户权限即可创建，VS Code 完全透明。
+     *
+     * 示例：mask.c 里有 javacard/framework/AppletEvent、javacard/framework/ISO7816
+     * → 真实目录 JCRE/src/javacard/framework/ → 一个 junction 挂到
+     *   {JCRE 虚拟根}/{工程名}/javacard/framework/ → 整目录暴露
+     */
+    private buildJcreTreeByJunction(
+        prj: KeilProject,
+        jcrePath: string,
+        norm: (p: string) => string,
+    ): { linked: Set<string> } | undefined {
+        this.channel.appendLine('[keil-assistant] JCRE junction 降级开始（无需管理员权限）');
+
+        if (!jcrePath || !existsSync(jcrePath)) {
+            if (jcrePath) this.channel.appendLine(`[keil-assistant] Keil.JCRE 路径无效: ${jcrePath}`);
+            return undefined;
+        }
+
+        const { classes, maskFiles } = this.scanMaskClasses(prj);
+
+        if (maskFiles.length === 0 || classes.length === 0) {
+            this.channel.appendLine(`[keil-assistant] ${prj.label}: 无 mask.c 或无 class@，跳过 JCRE。`);
+            return undefined;
+        }
+
+        // 1) 在 JCRE 路径下定位 .java
+        const mappings: { cls: string; realPath: string }[] = [];
+        const missing: string[] = [];
+
+        for (const cls of classes) {
+            const javaPath = resolve(jcrePath, cls.replace(/\//g, sep) + '.java');
+
+            if (existsSync(javaPath) && statSync(javaPath).isFile()) {
+                mappings.push({ cls, realPath: javaPath });
+            } else {
+                missing.push(cls);
+            }
+        }
+
+        if (missing.length > 0) {
+            const preview = missing.slice(0, 5);
+
+            this.channel.appendLine(
+                `[keil-assistant] ${prj.label}/JCRE junction: ${missing.length}/${classes.length} 未找到 .java（${preview.join(', ')}...）—— 扩展 API 忽略`
+            );
+        }
+
+        if (mappings.length === 0) {
+            this.channel.appendLine(`[keil-assistant] ${prj.label}/JCRE junction: 0 匹配，跳过。`);
+            return undefined;
+        }
+
+        // 2) 按包根目录聚合
+        //    cls = javacard/framework/AppletEvent → 包根 = javacard/framework/
+        //    真实目录 = JCRE/src/javacard/framework/
+        const pkgBuckets = new Map<string, { realDir: string; files: string[] }>();
+
+        for (const { cls, realPath } of mappings) {
+            const parts = cls.split('/');
+            parts.pop(); // 去掉类名 → 剩下包路径 javacard/framework/
+            const pkgRel = parts.join(sep); // javacard\framework
+            const realDir = dirname(realPath); // JCRE/src/javacard/framework
+
+            if (!pkgBuckets.has(pkgRel)) pkgBuckets.set(pkgRel, { realDir, files: [] });
+            pkgBuckets.get(pkgRel)!.files.push(realPath);
+        }
+
+        // 3) 签名比对
+        const prjSubdir = this.sanitizeDirName(prj.label);
+        const jcreRoot = join(this.virtualStorageRoot, 'JCRE');
+        const prjRoot = join(jcreRoot, prjSubdir);
+        const signature = 'junction|' + [...pkgBuckets.keys()].sort().join('|');
+        const prev = this.jcreStateByPrj.get(prj.prjID);
+
+        if (prev && prev.signature === signature && existsSync(prjRoot)) {
+            this.channel.appendLine(
+                `[keil-assistant] JCRE junction 签名未变化，复用上次结果（${prev.linked.size} 个文件）`
+            );
+            return { linked: prev.linked };
+        }
+
+        // 4) 创建虚拟根
+        try {
+            mkdirSync(jcreRoot, { recursive: true });
+            if (existsSync(prjRoot)) rmSync(prjRoot, { recursive: true, force: true });
+            mkdirSync(prjRoot, { recursive: true });
+        } catch (err) {
+            this.channel.appendLine(`[keil-assistant] JCRE junction 创建虚拟根失败: ${prjRoot}, msg: ${(err as Error).message}`);
+            this.jcreStateByPrj.delete(prj.prjID);
+            return undefined;
+        }
+
+        // 5) 每个包根目录建一个 junction
+        const linked = new Set<string>();
+        let junctionCount = 0;
+
+        for (const [pkgRel, { realDir, files }] of pkgBuckets) {
+            if (!existsSync(realDir)) continue;
+
+            const pkgVirtualDir = join(prjRoot, pkgRel);
+
+            // 先建中间父目录（javacard/、javacard/framework/）
+            const parentDir = dirname(pkgVirtualDir);
+
+            if (parentDir !== prjRoot) {
+                try { mkdirSync(parentDir, { recursive: true }); } catch { /* 忽略 */ }
+            }
+
+            try {
+                symlinkSync(realDir, pkgVirtualDir, 'junction');
+                junctionCount++;
+                for (const f of files) linked.add(norm(f));
+            } catch (err) {
+                const code = (err as NodeJS.ErrnoException).code;
+
+                if (code === 'EPERM' || code === 'EACCES') {
+                    this.channel.appendLine(
+                        '[keil-assistant] JCRE junction 也没权限（EPERM）—— 完全无权限环境，跳过 JCRE 虚拟树'
+                    );
+                    try { rmSync(prjRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
+                    this.jcreStateByPrj.delete(prj.prjID);
+                    return undefined;
+                }
+                this.channel.appendLine(
+                    `[keil-assistant] JCRE junction 失败 ${pkgRel}: ${code || (err as Error).message}`
+                );
+            }
+        }
+
+        if (linked.size === 0) {
+            this.channel.appendLine('[keil-assistant] JCRE junction: 0 成功，跳过。');
+            return undefined;
+        }
+
+        this.jcreStateByPrj.set(prj.prjID, { prjSubdir, signature, linked });
+
+        this.channel.appendLine(
+            `[keil-assistant] ${prj.label}/JCRE junction 完成: ${junctionCount} 个包 junction, 暴露 ${linked.size} 个 Java 文件`
+        );
+
+        return { linked };
+    }
+
+    /**
      * 清理虚拟目录（指定工程或全部）。
-     * 所有工程共用一个 JCVM 根，清理时只删某工程的子目录，不碰其他工程的链接。
+     * JCVM/{工程名} 和 JCRE/{工程名} 都会被清理；根目录空了会一并删除。
      */
     private cleanupVirtualDirs(prj?: KeilProject): void {
-        const removePrjSubdir = (subdir: string) => {
-            const fullPath = join(this.virtualStorageRoot, subdir);
+        const removeJCVM = (subdir: string) => {
+            const fullPath = join(this.virtualStorageRoot, 'JCVM', subdir);
 
             if (existsSync(fullPath)) {
                 try { rmSync(fullPath, { recursive: true, force: true }); } catch { /* 忽略 */ }
             }
-            // 如果 JCVM 根已空，也一并清掉
+        };
+        const removeJCRE = (subdir: string) => {
+            const fullPath = join(this.virtualStorageRoot, 'JCRE', subdir);
+
+            if (existsSync(fullPath)) {
+                try { rmSync(fullPath, { recursive: true, force: true }); } catch { /* 忽略 */ }
+            }
+        };
+        // 如果根目录已空（JCVM 和 JCRE 都空了），一并删除
+        const cleanupRoot = () => {
             try {
                 if (existsSync(this.virtualStorageRoot) && readdirSync(this.virtualStorageRoot).length === 0) {
                     rmSync(this.virtualStorageRoot, { recursive: true, force: true });
@@ -298,20 +824,26 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         };
 
         if (prj) {
-            const state = this.virtualStateByPrj.get(prj.prjID);
+            const jcvmState = this.virtualStateByPrj.get(prj.prjID);
 
-            if (state) {
-                removePrjSubdir(state.prjSubdir);
+            if (jcvmState) {
+                removeJCVM(jcvmState.prjSubdir);
                 this.virtualStateByPrj.delete(prj.prjID);
-                this.channel.appendLine(`[keil-assistant] 已清理虚拟目录: ${join(this.virtualStorageRoot, state.prjSubdir)}`);
             }
+            const jcreState = this.jcreStateByPrj.get(prj.prjID);
+
+            if (jcreState) {
+                removeJCRE(jcreState.prjSubdir);
+                this.jcreStateByPrj.delete(prj.prjID);
+            }
+            cleanupRoot();
         } else {
-            // 清理全部：整个 JCVM 根干掉
+            // 清理全部
             if (existsSync(this.virtualStorageRoot)) {
                 try { rmSync(this.virtualStorageRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
             }
             this.virtualStateByPrj.clear();
-            this.channel.appendLine(`[keil-assistant] 已清理全部虚拟目录: ${this.virtualStorageRoot}`);
+            this.jcreStateByPrj.clear();
         }
     }
 
@@ -467,26 +999,43 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             }
 
             // 4) 构建虚拟目录树（virtualSymlink 策略）
+            //    统一虚拟根下并列 JCVM/（工程源码 symlink）和 JCRE/（Java Card 运行时 API symlink）
+            //    这两类内容共用一个 workspace folder，Ctrl+Shift+F 能同时搜到工程源码和 JCRE 标准库
             const virtualFolders: { path: string; name: string }[] = [];
             const linkedFiles = new Set<string>();
+            let anyVirtualLinked = false;
 
             if (addStrategy === 'virtualSymlink') {
-                let anyLinked = false;
-
+                // 4a) JCVM：工程源码
                 for (const { prj, targets } of plansByPrj.values()) {
                     const state = this.buildVirtualTree(prj, targets, norm);
 
                     if (state && state.linked.size > 0) {
                         state.linked.forEach(f => linkedFiles.add(f));
-                        anyLinked = true;
+                        anyVirtualLinked = true;
                     }
                 }
-                // 所有工程共用一个 JCVM 虚拟根，成功创建至少一个 symlink 就把它加入工作区
-                if (anyLinked) {
-                    virtualFolders.push({ path: this.virtualStorageRoot, name: 'JCVM' });
+
+                // 4b) JCRE：mask.c 引用的 Java Card 标准 API 源码
+                //     需要 KeilAssistant.Keil.JCRE 配置指向 JCRE 源码根；未配置则跳过
+                const jcrePath = resMgr.getJcrePath();
+
+                for (const { prj } of plansByPrj.values()) {
+                    if (!jcrePath) break;
+                    const jcreState = this.buildJcreTree(prj, jcrePath, norm);
+
+                    if (jcreState && jcreState.linked.size > 0) {
+                        jcreState.linked.forEach(f => linkedFiles.add(f));
+                        anyVirtualLinked = true;
+                    }
                 }
-            } else if (this.virtualStateByPrj.size > 0) {
-                // 已切到 minimalCommonRoot 策略 → 清理旧的虚拟树
+
+                // 任何 symlink 成功 → 把统一根加入工作区
+                if (anyVirtualLinked) {
+                    virtualFolders.push({ path: this.virtualStorageRoot, name: 'Keil Virtual' });
+                }
+            } else if (this.virtualStateByPrj.size > 0 || this.jcreStateByPrj.size > 0) {
+                // 已切到 minimalCommonRoot 策略 → 清理旧的虚拟树（JCVM + JCRE）
                 this.cleanupVirtualDirs();
             }
 
@@ -783,6 +1332,8 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
     }
 
     async openProject(path: string, hasMultiplyProject: boolean): Promise<KeilProject | undefined> {
+        this.channel.appendLine(`[keil-assistant] openProject: path=${path}, hasMultiplyProject=${hasMultiplyProject}`);
+
         // workspacePath 初始值为空字符串 ''，不是 undefined；空值代表"未设置"
         if (!this.workspacePath) {
             const prjDir = dirname(path);
@@ -807,6 +1358,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
         if (nPrj) {
             if (!this.prjList.has(nPrj.prjID)) {
+                this.channel.appendLine(`[keil-assistant] 加载工程: label=${nPrj.label}, prjID=${nPrj.prjID}`);
 
                 // 【修复】先注册 dataChanged 监听，再 load：load() 内部会触发 notifyUpdateView() 发 dataChanged，
                 // 如果注册在 load 之后，首次加载的事件就没人接，scheduleSync 也就不会被触发。
@@ -817,6 +1369,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
                 await nPrj.load();
                 this.prjList.set(nPrj.prjID, nPrj);
+                this.channel.appendLine(`[keil-assistant] 工程加载完成: ${nPrj.label}, Targets=${nPrj.getTargets().length}`);
 
                 if (this.curActiveProject === undefined) {
                     this.curActiveProject = nPrj;
@@ -825,9 +1378,12 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
                 this.updateView();
                 // 工程加载完成后立即触发一次同步（不用等 debounce，确保自动生效）
+                this.channel.appendLine(`[keil-assistant] openProject 触发 scheduleSync（防抖 300ms）`);
                 this.scheduleSync();
 
                 return nPrj;
+            } else {
+                this.channel.appendLine(`[keil-assistant] 工程已存在，跳过重复加载: ${path}`);
             }
         }
 
@@ -838,6 +1394,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         const prj = this.prjList.get(pID);
 
         if (prj) {
+            this.channel.appendLine(`[keil-assistant] closeProject: prj=${prj.label}, prjID=${pID}`);
             prj.deactive();
             prj.close();
             this.prjList.delete(pID);
@@ -851,11 +1408,16 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
 
     async activeProject(view: IView) {
+        const prevLabel = this.curActiveProject?.label;
+
         this.curActiveProject?.deactive();
         const project = this.prjList.get(view.prjID);
 
         project?.active();
         this.curActiveProject = project;
+        this.channel.appendLine(
+            `[keil-assistant] activeProject: ${prevLabel ?? '无'} → ${project?.label ?? '无'}`
+        );
         this.updateView();
         // 激活工程后重新同步工作区文件夹
         this.scheduleSync();
@@ -872,6 +1434,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
         if (prj) {
             const tList = prj.getTargets();
+            const oldTarget = prj.getActiveTarget()?.targetName;
             const targetName = await window.showQuickPick(tList.map((ele) => ele.targetName), {
                 canPickMany: false,
                 placeHolder: l10n.t('please select a target name for keil project')
@@ -879,6 +1442,9 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
             if (targetName) {
                 prj.setActiveTarget(targetName);
+                this.channel.appendLine(
+                    `[keil-assistant] switchTarget: prj=${prj.label}, ${oldTarget ?? '无'} → ${targetName}`
+                );
                 // 切换 Target 后重新同步工作区文件夹（重建虚拟目录）
                 this.scheduleSync();
             }

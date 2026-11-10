@@ -168,6 +168,17 @@ export class ResourceManager {
     }
 
     /**
+     * 虚拟工作区根目录（KeilAssistant.Workspace.VirtualRoot）。
+     * 空字符串表示使用 VS Code 扩展全局存储目录作为 fallback（默认行为）。
+     * 如果当前用户对 C 盘没有写权限，可以在这里指定一个有写权限的路径。
+     */
+    public getVirtualRoot(): string {
+        const p = (this.getAppConfig().get<string>('Workspace.VirtualRoot') ?? '').trim();
+
+        return p;
+    }
+
+    /**
      * 处理模式：'activeTarget' 仅活动 Target，'allTargets' 所有 Target 去重合并
      */
     public getProcessMode(): 'activeTarget' | 'allTargets' {

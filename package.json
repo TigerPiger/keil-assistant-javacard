@@ -2,7 +2,7 @@
   "name": "keil-vscode-assistant",
   "displayName": "%displayName%",
   "description": "%description%",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "publisher": "Dastan",
   "icon": "res/icons/icon.png",
   "author": "Dastan <dastan@139.com>",
@@ -181,6 +181,12 @@
             "scope": "window",
             "markdownDescription": "%keil-assistant.contributes.conf.props.workspace.confirmBeforeAdd.description%",
             "default": false
+          },
+          "KeilAssistant.Workspace.VirtualRoot": {
+            "type": "string",
+            "scope": "window",
+            "markdownDescription": "**虚拟工作区根目录**：存放 JCVM/JCRE 的符号链接（symlink/hardlink）的统一根。\n\n默认留空时使用 VS Code 扩展全局存储目录（通常在 C 盘用户目录下）。如果当前用户对 C 盘没有写权限，可以在这里指定一个有写权限的路径（如 `D:\\keil-virtual`）。\n\n目录下会自动创建 `JCVM/` 和 `JCRE/` 两个子目录，分别存放工程源码和 Java Card 运行时 API 的符号链接。",
+            "default": ""
           }
         }
       }

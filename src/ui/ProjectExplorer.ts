@@ -51,9 +51,18 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         this.viewEvent = new EventEmitter();
         this.onDidChangeTreeData = this.viewEvent.event;
         this.workspacePath = '';
-        // 虚拟符号链接统一根：放在扩展全局存储里，下面并列 JCVM/ 和 JCRE/ 两个子目录
-        // 这样一个 workspace folder 就同时暴露两类虚拟内容，不污染工程目录
-        this.virtualStorageRoot = join(context.globalStorageUri.fsPath, 'keil-workspace');
+        // 虚拟符号链接统一根：优先使用用户配置（KeilAssistant.Workspace.VirtualRoot），
+        // 空字符串时 fallback 到 VS Code 扩展全局存储目录（通常在 C 盘用户目录下）。
+        // 用户指定的路径下自动并列 JCVM/ 和 JCRE/ 两个子目录。
+        const configuredRoot = ResourceManager.getInstance().getVirtualRoot();
+
+        if (configuredRoot) {
+            // 用户显式配置了路径 → 直接用
+            this.virtualStorageRoot = join(configuredRoot, 'keil-workspace');
+        } else {
+            // 默认 fallback
+            this.virtualStorageRoot = join(context.globalStorageUri.fsPath, 'keil-workspace');
+        }
         this.channel.appendLine(
             `[keil-assistant] ProjectExplorer 构造: globalStorageUri=${context.globalStorageUri.fsPath}, virtualStorageRoot=${this.virtualStorageRoot}`
         );

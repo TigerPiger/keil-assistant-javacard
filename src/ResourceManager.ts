@@ -133,6 +133,16 @@ export class ResourceManager {
         return this.getAppConfig().get<string[]>('Project.CustomIncludePaths') ?? [];
     }
 
+    /** 获取 JCRE（Java Card 运行时环境）源码根目录，空字符串表示未配置 */
+    getJcrePath(): string {
+        return this.getAppConfig().get<string>('Keil.JCRE') ?? '';
+    }
+
+    /** 是否启用扁平工作区模式（零磁盘写入，用 files.exclude 过滤） */
+    isFlatModeEnabled(): boolean {
+        return this.getAppConfig().get<boolean>('Workspace.FlatMode') ?? false;
+    }
+
     getIconByName(name: string): vscode.Uri {
         const icon = this.iconMap.get(name);
 

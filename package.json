@@ -141,6 +141,18 @@
             "scope": "resource",
             "markdownDescription": "%keil-assistant.contributes.conf.props.project.FindMaxDepth.description%",
             "default": 1
+          },
+          "KeilAssistant.Keil.JCRE": {
+            "type": "string",
+            "scope": "resource",
+            "markdownDescription": "Java Card 运行时环境（JCRE）源码根目录。插件将在此目录下递归查找 mask.c 引用的 .java 文件（如 javacard/framework/CardException.java）。",
+            "default": ""
+          },
+          "KeilAssistant.Workspace.FlatMode": {
+            "type": "boolean",
+            "scope": "resource",
+            "markdownDescription": "启用扁平工作区模式：自动计算 JCVM（工程源码）和 JCRE（Java Card API）的根目录，将它们加入 workspace，并用 files.exclude 过滤无关文件。零磁盘写入，无数据一致性风险。",
+            "default": false
           }
         }
       }

@@ -594,10 +594,14 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         jcrePath: string,
         norm: (p: string) => string,
     ): { linked: Set<string> } | undefined {
-        // JCRE 不再降级到 junction：junction 是目录级别的，会把整个包目录下所有 .java 都暴露出来
-        // （例如 mask.c 只引用了 CardException，但 OwnerPINx.java、package-info.java 也会出现）
-        // 这里改为始终尝试 symlink，symlink EPERM 时回退到 hardlink（NTFS 普通用户权限即可创建）
-        // hardlink 是文件级别的，能精确暴露 mask.c 引用的那些类
+        // JCRE symlink 策略：symlink → hardlink → junction（失败率过高时自动降级）
+        //
+        // junction 虽然是目录级别的（会暴露包目录下所有 .java），但在企业加密软件
+        // （亿赛通等）环境下，symlink 和 hardlink 可能都被拦截，junction 是唯一
+        // 可靠的方案。当 symlink+hardlink 失败率超过 50% 时自动降级到 junction。
+        //
+        // hardlink 是文件级别的，能精确暴露 mask.c 引用的那些类，是最优方案；
+        // junction 作为兜底，牺牲一点精确性换取可用性。
 
         if (!jcrePath || !existsSync(jcrePath)) {
             if (jcrePath) {
@@ -684,6 +688,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         // 5) 按包路径创建目录并 symlink
         const linked = new Set<string>();
         let failedCount = 0;
+        let hardlinkSuccessCount = 0;
 
         for (const { cls, realPath } of mappings) {
             // cls = javacard/framework/AppletEvent → 目录 javacard/framework/，文件名 AppletEvent.java
@@ -704,23 +709,61 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                 symlinkSync(realPath, linkPath, 'file');
                 linked.add(norm(realPath));
             } catch (err) {
-                // 任何 symlink 异常都尝试 hardlink 回退（不限错误码）
-                // 企业加密软件（如亿赛通）拦截 symlink 时可能返回 EINVAL/ENOSYS 等
-                // 非 EPERM/EACCES 的错误码，硬编码条件会漏掉这种情况
-                const code = (err as NodeJS.ErrnoException).code ?? '';
+                const errNo = err as NodeJS.ErrnoException;
+                const code = errNo.code ?? '';
+                const syscall = errNo.syscall ?? '';
+                const errPath = errNo.path ?? '';
 
                 try {
                     linkSync(realPath, linkPath);
                     linked.add(norm(realPath));
-                    // hardlink 静默成功，不刷屏
+                    hardlinkSuccessCount++;
+                    // hardlink 成功时打印少量日志（前 3 个），多了静默
+                    if (hardlinkSuccessCount <= 3) {
+                        this.channel.appendLine(
+                            `[keil-assistant] JCRE symlink 失败(${code}) → hardlink 成功: ${cls}`
+                        );
+                    }
                 } catch (err2) {
-                    const code2 = (err2 as NodeJS.ErrnoException).code ?? '';
+                    const errNo2 = err2 as NodeJS.ErrnoException;
+                    const code2 = errNo2.code ?? '';
+                    const syscall2 = errNo2.syscall ?? '';
+                    const errPath2 = errNo2.path ?? '';
+
+                    // 详细日志：两个错误 + 完整路径，方便定位
                     this.channel.appendLine(
-                        `[keil-assistant] JCRE symlink+hardlink 均失败 ${fileName}: sym=${code || (err as Error).message}, hard=${code2 || (err2 as Error).message} —— 跳过此文件`
+                        `[keil-assistant] JCRE symlink+hardlink 均失败 ${fileName}:`
+                    );
+                    this.channel.appendLine(
+                        `  realPath=${realPath}, linkPath=${linkPath}`
+                    );
+                    this.channel.appendLine(
+                        `  symlink: code=${code || '?'}, syscall=${syscall || '?'}, err.path=${errPath || '?'}, msg=${(err as Error).message}`
+                    );
+                    this.channel.appendLine(
+                        `  hardlink: code=${code2 || '?'}, syscall=${syscall2 || '?'}, err.path=${errPath2 || '?'}, msg=${(err2 as Error).message}`
                     );
                     failedCount++;
                 }
             }
+        }
+
+        // 6) 失败率过高 → 自动降级到 junction（目录级别，牺牲精确性换取可用性）
+        //    阈值：失败 > 3 且失败率 ≥ 50%（避免小样本波动）
+        if (mappings.length > 3 && failedCount * 2 >= mappings.length) {
+            this.channel.appendLine(
+                `[keil-assistant] JCRE symlink+hardlink 失败率 ${failedCount}/${mappings.length}（${Math.round(failedCount * 100 / mappings.length)}%），自动降级到 junction（目录联接）`
+            );
+
+            // 清理 symlink 半成品
+            try {
+                if (existsSync(prjRoot)) rmSync(prjRoot, { recursive: true, force: true });
+            } catch { /* 忽略 */ }
+
+            const junctionResult = this.buildJcreTreeByJunction(prj, jcrePath, norm);
+
+            if (junctionResult) return junctionResult;
+            // junction 也失败了 → 继续返回当前 linked（可能是空集合）
         }
 
         // 清理空的 JCVM/JCRE 共用虚拟根

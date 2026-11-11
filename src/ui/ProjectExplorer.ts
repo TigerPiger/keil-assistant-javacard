@@ -270,24 +270,31 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                         symlinkSync(realPath, linkPath, 'file');
                         linked.add(norm(realPath));
                     } catch (err) {
-                        const code = (err as NodeJS.ErrnoException).code;
+                        // 任何 symlink 异常都尝试 hardlink 回退（不限错误码）
+                        // 企业加密软件（如亿赛通）拦截 symlink 时可能返回 EINVAL/ENOSYS 等
+                        // 非 EPERM/EACCES 的错误码，硬编码条件会漏掉这种情况
+                        const code = (err as NodeJS.ErrnoException).code ?? '';
 
-                        // 权限类错误说明 symlink 不可用 → 回退 hardlink
-                        if (code === 'EPERM' || code === 'EACCES' || code === 'UNKNOWN') {
-                            try {
-                                linkSync(realPath, linkPath);
-                                linked.add(norm(realPath));
-                                // hardlink 静默成功，不刷屏（JCVM 可能有大量文件）
-                            } catch (err2) {
-                                // hardlink 也失败 → 完全放弃，降级 junction
-                                this.channel.appendLine(
-                                    `[keil-assistant] JCVM symlink+hardlink 均失败 ${basename(realPath)}: ${(err2 as NodeJS.ErrnoException).code || (err2 as Error).message} —— 降级 junction`
-                                );
+                        try {
+                            linkSync(realPath, linkPath);
+                            linked.add(norm(realPath));
+                            // hardlink 静默成功
+                        } catch (err2) {
+                            const code2 = (err2 as NodeJS.ErrnoException).code ?? '';
+
+                            // symlink+hardlink 全失败 → 触发 junction 降级
+                            failedCount++;
+                            // EXDEV：hardlink 跨卷不支持，说明 VirtualRoot 和工程文件在不同盘
+                            // EPERM/EACCES：安全软件拦截 hardlink
+                            // 任何一种 hardlink 失败都应触发 junction 降级
+                            this.channel.appendLine(
+                                `[keil-assistant] JCVM symlink+hardlink 均失败 ${basename(realPath)}: sym=${code || (err as Error).message}, hard=${code2 || (err2 as Error).message}`
+                            );
+                            // 第一个 hardlink 失败就触发 junction 降级，避免 N 个文件重复报错刷屏
+                            if (!aborted) {
                                 aborted = true;
                                 break;
                             }
-                        } else {
-                            failedCount++;
                         }
                     }
                 }
@@ -616,27 +623,20 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                 symlinkSync(realPath, linkPath, 'file');
                 linked.add(norm(realPath));
             } catch (err) {
-                const code = (err as NodeJS.ErrnoException).code;
+                // 任何 symlink 异常都尝试 hardlink 回退（不限错误码）
+                // 企业加密软件（如亿赛通）拦截 symlink 时可能返回 EINVAL/ENOSYS 等
+                // 非 EPERM/EACCES 的错误码，硬编码条件会漏掉这种情况
+                const code = (err as NodeJS.ErrnoException).code ?? '';
 
-                if (code === 'EPERM' || code === 'EACCES' || code === 'UNKNOWN') {
-                    // symlink 权限不足 → 回退到 hardlink
-                    // hardlink 在 NTFS 上普通用户权限即可创建，且是文件级别的
-                    // （不会像 junction 那样暴露整个包目录的无关文件）
-                    try {
-                        linkSync(realPath, linkPath);
-                        linked.add(norm(realPath));
-                        this.channel.appendLine(
-                            `[keil-assistant] JCRE symlink 失败（${code}），已回退到 hardlink: ${fileName}`
-                        );
-                    } catch (err2) {
-                        const code2 = (err2 as NodeJS.ErrnoException).code;
-                        // hardlink 可能失败：EXDEV（跨卷不支持）、EPERM/EACCES（权限）等
-                        this.channel.appendLine(
-                            `[keil-assistant] JCRE hardlink 也失败 ${fileName}: ${code2 || (err2 as Error).message} —— 跳过此文件`
-                        );
-                        failedCount++;
-                    }
-                } else {
+                try {
+                    linkSync(realPath, linkPath);
+                    linked.add(norm(realPath));
+                    // hardlink 静默成功，不刷屏
+                } catch (err2) {
+                    const code2 = (err2 as NodeJS.ErrnoException).code ?? '';
+                    this.channel.appendLine(
+                        `[keil-assistant] JCRE symlink+hardlink 均失败 ${fileName}: sym=${code || (err as Error).message}, hard=${code2 || (err2 as Error).message} —— 跳过此文件`
+                    );
                     failedCount++;
                 }
             }

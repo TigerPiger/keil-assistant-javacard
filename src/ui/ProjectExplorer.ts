@@ -1,5 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
-import { statSync, readFileSync, readdirSync, mkdirSync, symlinkSync, linkSync, rmSync, existsSync } from "fs";
+import { statSync, readFileSync, readdirSync, mkdirSync, symlinkSync, linkSync, rmSync, existsSync, unlinkSync } from "fs";
 import { basename, dirname, extname, join, normalize, resolve, sep } from "path";
 import type {
     Event, ExtensionContext, ProviderResult, TreeDataProvider,
@@ -42,7 +42,10 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
     // 每个工程上一次生成的 JCVM 源码虚拟树状态
     private virtualStateByPrj: Map<string, { prjSubdir: string; signature: string; linked: Set<string> }> = new Map();
     // 每个工程上一次生成的 JCRE 虚拟树状态
-    private jcreStateByPrj: Map<string, { prjSubdir: string; signature: string; linked: Set<string> }> = new Map();
+    private jcreStateByPrj: Map<string, { prjSubdir: string; signature: string; linked: Set<string>; mode: 'symlink' | 'junction' }> = new Map();
+    // JCRE 全量 .java 文件索引缓存：key=jcreRoot 路径，value=Map<fileName, 候选完整路径[]>
+    // 避免每次 findJavaFile 都完整 walk 一遍 jcreRoot（131 个类 × 2000 个文件 = 26 万次 statSync）
+    private jcreFileIndex: Map<string, Map<string, string[]>> = new Map();
     // 当前环境是否支持创建符号链接（探测到 EPERM 后置为 true，不再重复尝试）
     private symlinkUnsupported = false;
 
@@ -484,7 +487,8 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                         // class@...: 地址: [访问修饰符] [其他修饰符...] [class/interface] <全限定名>
                         // 注意：实际 mask.c 注释格式灵活，有的省略了 class/interface 关键字，
                         // 还可能出现 final/static/native 等修饰符，所以这里全部做成可选
-                        const re = /class@[^:]*:\s*0x[0-9a-fA-F]+:\s*(?:(?:public|private|protected)\s+)?(?:(?:abstract|final|native|static|synchronized|transient|strictfp)\s+)*(?:(?:interface|class)\s+)?([a-zA-Z_][\w/.]*)/g;
+                        // 末尾加边界约束 (?=\s|$|\*/|") 防止跨注释块贪婪捕获下一行内容
+                        const re = /class@[^:]*:\s*0x[0-9a-fA-F]+:\s*(?:(?:public|private|protected)\s+)?(?:(?:abstract|final|native|static|synchronized|transient|strictfp)\s+)*(?:(?:interface|class)\s+)?([a-zA-Z_][\w/.]*)(?=\s|$|\*\/|")/g;
                         let m: RegExpExecArray | null;
 
                         while ((m = re.exec(content)) !== null) {
@@ -509,9 +513,8 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
      *
      * 搜索策略：
      *   1) 先尝试直接拼接（最快路径）：resolve(jcreRoot, cls.split('/').join(sep) + '.java')
-     *   2) 直接拼接失败则递归遍历 jcreRoot 下所有 .java 文件，
-     *      优先匹配路径尾巴与 cls 一致的文件（如 cls=java/lang/Object，
-     *      优先匹配 .../java/lang/Object.java 而不是 .../other/java/lang/Object.java）
+     *   2) 直接拼接失败则用缓存索引（只在第一次调用时 walk 全目录）：
+     *      优先选路径尾巴与 cls 完全一致的文件，其次选最后一级包名匹配的
      *
      * @param jcreRoot  JCRE 源码根目录（用户配置的 KeilAssistant.Keil.JCRE）
      * @param cls       类路径，如 javacard/framework/AppletEvent
@@ -519,7 +522,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
      */
     private findJavaFile(jcreRoot: string, cls: string): string | null {
         const parts = cls.split('/');
-        const exactTail = parts.join(sep) + '.java'; // java/lang/Object.java
+        const exactTail = parts.join(sep) + '.java'; // java\lang\Object.java
         const fileName = parts[parts.length - 1] + '.java'; // Object.java
 
         // --- 策略 1：直接拼接（最快，兼容大部分标准布局）---
@@ -531,9 +534,41 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             if (st.isFile()) return directPath;
         }
 
-        // --- 策略 2：递归搜索 jcreRoot 下所有 .java ---
-        // 找到所有文件名为 fileName 的候选，优先选路径尾巴匹配 exactTail 的
-        const candidates: string[] = [];
+        // --- 策略 2：走缓存索引 ---
+        const index = this.getJcreFileIndex(jcreRoot);
+        const candidates = index.get(fileName);
+
+        if (!candidates || candidates.length === 0) return null;
+
+        // 优先选路径尾巴与 exactTail 完全匹配的（如 cls=java/lang/Object → 优先 .../api/java/lang/Object.java）
+        for (const c of candidates) {
+            if (c.endsWith(exactTail)) return c;
+        }
+
+        // 次优：路径中包含 cls + '.java' 的（正斜杠格式，兼容 Windows 反斜杠路径）
+        const slashTail = cls.replace(/\//g, sep) + '.java';
+
+        for (const c of candidates) {
+            if (c.endsWith(slashTail)) return c;
+        }
+
+        // 兜底：返回第一个候选
+        return candidates[0];
+    }
+
+    /**
+     * 获取（或构建）jcreRoot 下的全量 .java 文件索引。
+     * 只在第一次针对某个 jcreRoot 调用时完整 walk，后续直接返回缓存。
+     * 索引结构：Map<fileName, 完整路径[]>，如 "Object.java" → ["D:\\jcre\\api\\java\\lang\\Object.java", ...]
+     */
+    private getJcreFileIndex(jcreRoot: string): Map<string, string[]> {
+        // 命中缓存 → 直接返回
+        const cached = this.jcreFileIndex.get(jcreRoot);
+
+        if (cached) return cached;
+
+        // 首次：完整 walk 一次
+        const index = new Map<string, string[]>();
 
         const walk = (dir: string) => {
             let entries: string[];
@@ -556,31 +591,25 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
                 if (st.isDirectory()) {
                     walk(full);
-                } else if (st.isFile() && name === fileName) {
-                    candidates.push(full);
+                } else if (st.isFile() && name.endsWith('.java')) {
+                    const list = index.get(name);
+
+                    if (list) {
+                        list.push(full);
+                    } else {
+                        index.set(name, [full]);
+                    }
                 }
             }
         };
 
         walk(jcreRoot);
+        this.jcreFileIndex.set(jcreRoot, index);
+        this.channel.appendLine(
+            `[keil-assistant] JCRE 索引构建完成: ${jcreRoot}, 共 ${index.size} 个不同的 .java 文件名`
+        );
 
-        if (candidates.length === 0) return null;
-
-        // 优先选路径尾巴与 exactTail 完全匹配的
-        for (const c of candidates) {
-            if (c.endsWith(exactTail)) return c;
-        }
-
-        // 次优：选路径中包含 cls 最后一级包名的（如 java/lang/Object）
-        for (const c of candidates) {
-            // Windows 下路径可能是反斜杠，统一替换成正斜杠比较
-            const normalized = c.replace(/\\/g, '/');
-
-            if (normalized.endsWith(cls + '.java')) return c;
-        }
-
-        // 兜底：返回第一个候选（但仍然确认是文件）
-        return candidates[0];
+        return index;
     }
 
     /**
@@ -665,6 +694,16 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
         const signature = mappings.map(m => m.cls).join('|');
         const prev = this.jcreStateByPrj.get(prj.prjID);
 
+        // 如果上次已经降级到 junction（亿赛通等环境），直接复用 junction 模式，
+        // 避免每次重启都先完整尝试 symlink → 失败 → 再降级 junction（两遍全量扫描）
+        if (prev?.mode === 'junction') {
+            this.channel.appendLine(
+                `[keil-assistant] 上次已降级到 junction，直接复用 junction 模式（避免重复尝试 symlink）`
+            );
+
+            return this.buildJcreTreeByJunction(prj, jcrePath, norm);
+        }
+
         if (prev && prev.signature === signature && existsSync(prjRoot)) {
             this.channel.appendLine(
                 `[keil-assistant] JCRE 签名未变化，复用上次结果（${prev.linked.size} 个 symlink，路径 ${prjRoot}）`
@@ -705,6 +744,11 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
 
             const linkPath = join(pkgDir, fileName);
 
+            // H1: linkPath 已存在时先清理（避免 EEXIST）
+            if (existsSync(linkPath)) {
+                try { unlinkSync(linkPath); } catch { /* 忽略 */ }
+            }
+
             try {
                 symlinkSync(realPath, linkPath, 'file');
                 linked.add(norm(realPath));
@@ -729,6 +773,17 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
                     const code2 = errNo2.code ?? '';
                     const syscall2 = errNo2.syscall ?? '';
                     const errPath2 = errNo2.path ?? '';
+
+                    // H2: EXDEV 是跨卷导致 hardlink 必然失败，打印针对性提示
+                    if (code2 === 'EXDEV' && failedCount === 0) {
+                        this.channel.appendLine(
+                            `[keil-assistant] ⚠️ hardlink EXDEV: VirtualRoot 和 JCRE 源码不在同一卷上，hardlink 不支持跨卷。`
+                        );
+                        this.channel.appendLine(
+                            `  VirtualRoot=${this.virtualStorageRoot}, JCRE_SRC=${jcrePath}`
+                        );
+                        this.channel.appendLine(`  将自动降级 junction（目录联接，支持跨卷）`);
+                    }
 
                     // 详细日志：两个错误 + 完整路径，方便定位
                     this.channel.appendLine(
@@ -771,7 +826,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             if (existsSync(jcreRoot) && readdirSync(jcreRoot).length === 0) rmSync(jcreRoot);
         } catch { /* 忽略 */ }
 
-        this.jcreStateByPrj.set(prj.prjID, { prjSubdir, signature, linked });
+        this.jcreStateByPrj.set(prj.prjID, { prjSubdir, signature, linked, mode: 'symlink' });
 
         this.channel.appendLine(
             `[keil-assistant] ${prj.label}/JCRE: 成功 ${linked.size}/${mappings.length} 个 Java Card API 源码 symlink（来自 ${maskFiles.length} 个 mask.c）`
@@ -919,7 +974,7 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             return undefined;
         }
 
-        this.jcreStateByPrj.set(prj.prjID, { prjSubdir, signature, linked });
+        this.jcreStateByPrj.set(prj.prjID, { prjSubdir, signature, linked, mode: 'junction' });
 
         this.channel.appendLine(
             `[keil-assistant] ${prj.label}/JCRE junction 完成: ${junctionCount} 个包 junction, 暴露 ${linked.size} 个 Java 文件`

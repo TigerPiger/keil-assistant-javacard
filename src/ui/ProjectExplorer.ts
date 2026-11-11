@@ -503,6 +503,87 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
     }
 
     /**
+     * 在 jcreRoot 下递归搜索指定类路径的 .java 文件。
+     * 解决 JCRE 源码目录层级不统一的问题（有些是 api/java/lang/Object.java，
+     * 有些是 gpsrc/org/globalplatform/CVM.java，中间隔了不同的子目录）。
+     *
+     * 搜索策略：
+     *   1) 先尝试直接拼接（最快路径）：resolve(jcreRoot, cls.split('/').join(sep) + '.java')
+     *   2) 直接拼接失败则递归遍历 jcreRoot 下所有 .java 文件，
+     *      优先匹配路径尾巴与 cls 一致的文件（如 cls=java/lang/Object，
+     *      优先匹配 .../java/lang/Object.java 而不是 .../other/java/lang/Object.java）
+     *
+     * @param jcreRoot  JCRE 源码根目录（用户配置的 KeilAssistant.Keil.JCRE）
+     * @param cls       类路径，如 javacard/framework/AppletEvent
+     * @returns .java 文件的绝对路径（只返回真实文件，排除目录）；找不到返回 null
+     */
+    private findJavaFile(jcreRoot: string, cls: string): string | null {
+        const parts = cls.split('/');
+        const exactTail = parts.join(sep) + '.java'; // java/lang/Object.java
+        const fileName = parts[parts.length - 1] + '.java'; // Object.java
+
+        // --- 策略 1：直接拼接（最快，兼容大部分标准布局）---
+        const directPath = resolve(jcreRoot, exactTail);
+
+        if (existsSync(directPath)) {
+            const st = statSync(directPath);
+
+            if (st.isFile()) return directPath;
+        }
+
+        // --- 策略 2：递归搜索 jcreRoot 下所有 .java ---
+        // 找到所有文件名为 fileName 的候选，优先选路径尾巴匹配 exactTail 的
+        const candidates: string[] = [];
+
+        const walk = (dir: string) => {
+            let entries: string[];
+
+            try {
+                entries = readdirSync(dir);
+            } catch {
+                return;
+            }
+
+            for (const name of entries) {
+                const full = join(dir, name);
+                let st: ReturnType<typeof statSync>;
+
+                try {
+                    st = statSync(full);
+                } catch {
+                    continue;
+                }
+
+                if (st.isDirectory()) {
+                    walk(full);
+                } else if (st.isFile() && name === fileName) {
+                    candidates.push(full);
+                }
+            }
+        };
+
+        walk(jcreRoot);
+
+        if (candidates.length === 0) return null;
+
+        // 优先选路径尾巴与 exactTail 完全匹配的
+        for (const c of candidates) {
+            if (c.endsWith(exactTail)) return c;
+        }
+
+        // 次优：选路径中包含 cls 最后一级包名的（如 java/lang/Object）
+        for (const c of candidates) {
+            // Windows 下路径可能是反斜杠，统一替换成正斜杠比较
+            const normalized = c.replace(/\\/g, '/');
+
+            if (normalized.endsWith(cls + '.java')) return c;
+        }
+
+        // 兜底：返回第一个候选（但仍然确认是文件）
+        return candidates[0];
+    }
+
+    /**
      * 构建 JCRE 源码虚拟树：
      *   <virtualStorageRoot>/JCRE/{工程名}/{javacard/framework/AppletEvent.java} → symlink(JCRE/src/javacard/framework/AppletEvent.java)
      *
@@ -545,15 +626,15 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             return undefined;
         }
 
-        // 2) 在 JCRE 路径下定位 .java
+        // 2) 在 JCRE 路径下定位 .java（递归搜索，支持嵌套子目录如 api/java/lang/Object.java）
         const mappings: { cls: string; realPath: string }[] = [];
         const missing: string[] = [];
 
         for (const cls of classes) {
-            const javaPath = resolve(jcrePath, cls.replace(/\//g, sep) + '.java');
+            const realPath = this.findJavaFile(jcrePath, cls);
 
-            if (existsSync(javaPath) && statSync(javaPath).isFile()) {
-                mappings.push({ cls, realPath: javaPath });
+            if (realPath) {
+                mappings.push({ cls, realPath });
             } else {
                 missing.push(cls);
             }
@@ -686,15 +767,15 @@ export class ProjectExplorer implements TreeDataProvider<IView> {
             return undefined;
         }
 
-        // 1) 在 JCRE 路径下定位 .java
+        // 1) 在 JCRE 路径下定位 .java（递归搜索，和 buildJcreTree 保持一致）
         const mappings: { cls: string; realPath: string }[] = [];
         const missing: string[] = [];
 
         for (const cls of classes) {
-            const javaPath = resolve(jcrePath, cls.replace(/\//g, sep) + '.java');
+            const realPath = this.findJavaFile(jcrePath, cls);
 
-            if (existsSync(javaPath) && statSync(javaPath).isFile()) {
-                mappings.push({ cls, realPath: javaPath });
+            if (realPath) {
+                mappings.push({ cls, realPath });
             } else {
                 missing.push(cls);
             }
